@@ -4,6 +4,7 @@
 """
 
 import math
+import nvtx
 import torch
 import torch.nn.functional as F
 
@@ -663,6 +664,7 @@ def _chunk_state_varlen_kernel(
 
 
 def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
+    # h_chunk_cumsum_fwd_setup = nvtx.start_range("chunk_cumsum_fwd_setup")
     batch, seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
@@ -671,6 +673,7 @@ def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_lim
     dt_out = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     dA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     grid_chunk_cs = lambda META: (batch, nchunks, triton.cdiv(nheads, META['BLOCK_SIZE_H']))
+    # nvtx.end_range(h_chunk_cumsum_fwd_setup)
     with torch.cuda.device(dt.device.index):
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
             dt, A, dt_bias, dt_out, dA_cumsum,

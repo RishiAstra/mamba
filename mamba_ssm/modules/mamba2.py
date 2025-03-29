@@ -2,6 +2,7 @@
 
 import math
 
+import nvtx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -175,11 +176,17 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 out, _, _ = self.step(u, conv_state, ssm_state)
                 return out
 
-        zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+        # zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+        # zxbcdt = self.forward_in_proj(u)
+        h_in_proj = nvtx.start_range("in_proj", color="red")
+        zxbcdt = self.in_proj(u)
+        nvtx.end_range(h_in_proj)
         if seqlen_og is not None:
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
+        h_a_stuff = nvtx.start_range("A_stuff", color="yellow")
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+        nvtx.end_range(h_a_stuff)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
@@ -217,8 +224,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 if cu_seqlens is None:
                     # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                    h_conv_state = nvtx.start_range("conv_state_update", color="yellow")
                     xBC_t = rearrange(xBC, "b l d -> b d l")
                     conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
+                    nvtx.end_range(h_conv_state)
                 else:
                     assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
                     assert batch == 1, "varlen inference only supports batch dimension 1"
@@ -229,9 +238,20 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             assert self.activation in ["silu", "swish"]
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
                 assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
-                xBC = self.act(
-                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
-                )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+                # xBC = self.act(
+                #     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
+                # )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+                # xBC = self.forward_conv_stuff(xBC)
+                h_cpt = nvtx.start_range("conv_pre_trans", color="yellow")
+                xBC_t = xBC.transpose(1, 2)
+                nvtx.end_range(h_cpt)
+                h_co = nvtx.start_range("conv1d_other", color="green")
+                xBC_na = self.conv1d(xBC_t).transpose(1, 2)[:, :-(self.d_conv - 1)]
+                nvtx.end_range(h_co)
+                # h_act = nvtx.start_range("act", color="green")
+                xBC = self.act(xBC_na)
+                # nvtx.end_range(h_act)
+
             else:
                 xBC = causal_conv1d_fn(
                     xBC.transpose(1, 2),
@@ -241,6 +261,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            # h_ssm = nvtx.start_range("ssm", color="blue")
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
@@ -258,6 +279,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 return_final_states=ssm_state is not None,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
             )
+            # nvtx.end_range(h_ssm)
             if ssm_state is not None:
                 y, last_state, *rest = y
                 if cu_seqlens is None:
@@ -272,7 +294,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 y = torch.cat([F.silu(z0) * x0, y], dim=-1)
             if seqlen_og is not None:
                 y = rearrange(y, "b l d -> (b l) d")
+            h_op = nvtx.start_range("out_proj", color="red")
             out = self.out_proj(y)
+            nvtx.end_range(h_op)
+            # out = self.forward_out_proj(y)
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):

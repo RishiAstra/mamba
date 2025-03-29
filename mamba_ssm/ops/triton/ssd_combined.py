@@ -6,6 +6,7 @@
 from typing import Optional
 
 import math
+import nvtx
 from packaging import version
 
 import torch
@@ -279,6 +280,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
 
 
 def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
+    h_ssm_setup1 = nvtx.start_range("ssm_setup1")
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -293,16 +295,27 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
+    nvtx.end_range(h_ssm_setup1)
+    h_ssm_setup2 = nvtx.start_range("ssm_setup2")
     if B.stride(-1) != 1:
         B = B.contiguous()
+    nvtx.end_range(h_ssm_setup2)
+    h_ssm_setup3 = nvtx.start_range("ssm_setup3")
     if C.stride(-1) != 1:
         C = C.contiguous()
+    nvtx.end_range(h_ssm_setup3)
+    h_ssm_setup4 = nvtx.start_range("ssm_setup4")
     if x.stride(-1) != 1 and x.stride(1) != 1:  # Either M or K dimension should be contiguous
         x = x.contiguous()
+    nvtx.end_range(h_ssm_setup4)
+    h_ssm_setup5 = nvtx.start_range("ssm_setup5")
     if z is not None and z.stride(-1) != 1 and z.stride(1) != 1:  # Either M or K dimension should be contiguous
         z = z.contiguous()
+    nvtx.end_range(h_ssm_setup5)
+    h_ssm_setup6 = nvtx.start_range("ssm_setup6")
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
+    nvtx.end_range(h_ssm_setup6)
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
     # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
@@ -559,6 +572,7 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
         return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, dinitial_states, None, None, None, None, None, None
 
 
+# @nvtx.annotate("mamba_chunk_scan_combined", color="blue")
 def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False):
     """
     Argument:
@@ -908,6 +922,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
 
 
+@nvtx.annotate("mamba_split_conv1d_scan_combined", color="blue")
 def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
     """
     Argument:

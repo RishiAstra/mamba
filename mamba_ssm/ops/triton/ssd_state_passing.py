@@ -108,7 +108,7 @@ def _state_passing_fwd_kernel_persistent(
     stride_states_batch, stride_states_chunk, stride_states_head, stride_states_dim,
     stride_out_batch, stride_out_chunk, stride_out_head, stride_out_dim,
     stride_final_states_batch, stride_final_states_head, stride_final_states_dim,
-    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, offset_dA_cs_last_elem,
     stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
     # Meta-parameters
@@ -120,7 +120,7 @@ def _state_passing_fwd_kernel_persistent(
     target_grid_size = grid_dim_dim * batch * nheads
 
     states_ptr_base = states_ptr
-    dA_cs_ptr_base = dA_cs_ptr
+    dA_cs_ptr_base = dA_cs_ptr + offset_dA_cs_last_elem
     out_ptr_base = out_ptr
     final_states_ptr_base = final_states_ptr
     if HAS_INITSTATES:
@@ -340,6 +340,42 @@ def _state_passing_fwd_persistent(states, dA_chunk_cumsum, initial_states=None, 
             final_states.stride(0), final_states.stride(1), final_states.stride(2),
             dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
             *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
+              if initial_states is not None else (0, 0, 0)),
+            *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+            HAS_INITSTATES=initial_states is not None,
+            HAS_SEQ_IDX=seq_idx is not None,
+        )
+    return out, final_states
+
+
+def _state_passing_fwd_persistent_gooddims(states, dA_chunk_cumsum, initial_states=None, seq_idx=None, chunk_size=None,
+                       out_dtype=None):
+    batch, nchunks, nheads, dim1, dim2 = states.shape
+    dim = dim1 * dim2
+    assert dA_chunk_cumsum.shape[:3] == (batch, nheads, nchunks)
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, dim1, dim2)
+    assert chunk_size is not None
+    if seq_idx is not None:
+        seqlen = seq_idx.shape[-1]
+        assert seq_idx.shape == (batch, seqlen)
+    out_dtype = states.dtype if out_dtype is None else out_dtype
+    out = torch.empty((batch, nchunks, nheads, dim1, dim2), device=states.device, dtype=out_dtype)
+    final_states = torch.empty((batch, nheads, dim1, dim2), device=states.device, dtype=torch.float32)
+    # grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
+    actual_grid_size = lambda META: (torch.cuda.get_device_properties("cuda").multi_processor_count,) # TODO: in all this new code, I hardcoded device "cuda"
+    grid_atomic = torch.zeros((1), device="cuda")
+    with torch.cuda.device(states.device.index):
+        _state_passing_fwd_kernel_persistent[actual_grid_size](
+            grid_atomic,
+            states, out, final_states, dA_chunk_cumsum, initial_states, seq_idx,
+            dim, nchunks, seqlen if seq_idx is not None else 0, chunk_size if seq_idx is not None else 0, batch, nheads,
+            states.stride(0), states.stride(1), states.stride(2), states.stride(4), # 3 and 4 merged so use 4's stride. TODO: hardcoded expectation of row majority
+            out.stride(0), out.stride(1), out.stride(2), out.stride(4), # merged last 2 dims again
+            final_states.stride(0), final_states.stride(1), final_states.stride(3), # merged last 2 dims again
+            dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
+            dA_chunk_cumsum.stride(-1) * (chunk_size - 1), # offset to index into the last element along last dim
+            *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(3)) # merged last 2 dims again TODO: not tested
               if initial_states is not None else (0, 0, 0)),
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             HAS_INITSTATES=initial_states is not None,

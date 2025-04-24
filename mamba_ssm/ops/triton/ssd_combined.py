@@ -282,15 +282,19 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
 # this is just a basic combo of the original chunk_state and state_passing configs
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        # We are testing with Mamba2-2.7B which seems to have default hdim=64 and dstate=128 which correspond to BLOCK_SIZE_M and BLOCK_SIZE_N
+        # therefore, configs with more in either dim are not useful for now
+        # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=32),
+        # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
+        # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
+        # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 64*128}, num_stages=3, num_warps=32), # BLOCK_SIZE_MN must be BLOCK_SIZE_M * BLOCK_SIZE_N
+        # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 64*32}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 32*64}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 64*64}, num_stages=3, num_warps=32),
+        # new config to only split hdim
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 32*128}, num_stages=3, num_warps=32),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'dim'],
 )
@@ -330,7 +334,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
-    BLOCK_SIZE_SP: tl.constexpr,
+    BLOCK_SIZE_MN: tl.constexpr,
 ):
     grid_dim_headdim = tl.cdiv(hdim, BLOCK_SIZE_M)
     grid_dim_dstate = tl.cdiv(dstate, BLOCK_SIZE_N)
@@ -419,9 +423,19 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     while(old_grid_atomic < target_grid_size + grid_size_SMs):
         old_grid_atomic = tl.atomic_add(grid_atomic, 0).to(tl.int32)
 
+    # Note:
+    # Step 1 processes a block of size BLOCK_SIZE_M * BLOCK_SIZE_N in the hdim * dstate dimensions, with pid m, n, c, b, h
+    # Step 2 processes a block of size BLOCK_SIZE_SP in the dim dimension, with pid m2, b, h
+    # if we want to overlap them, we want Step 1 to do work in the order than Step 2 consumes the results
+    # in order to start work, we need a whole m2 block to start
+    # in order to keep having stuff to do, both kernels must process the other dims in the same order
+    # therefore, we can have b, h, and even m2 (if BLOCK_SIZE_SP = BLOCK_SIZE_M * BLOCK_SIZE_N) in the same order as batch dimensions
+    # but Step 1 must have finished all of the batch along the c dimension for the work to be ready (since Step 2 iterates all chunks)
 
-    
-    grid_dim_dim = tl.cdiv(dim, BLOCK_SIZE_SP)
+    # # we use this combined dim, but restrict the block size to be the same as step 1
+    # BLOCK_SIZE_SP = BLOCK_SIZE_M * BLOCK_SIZE_N
+
+    grid_dim_dim = tl.cdiv(dim, BLOCK_SIZE_MN)
     target_grid_size2 = grid_dim_dim * batch * nheads
 
     dA_cs_ptr_base = dA_cs_ptr + offset_dA_cs_last_elem
@@ -449,13 +463,13 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
         if HAS_SEQ_IDX:
             seq_idx_ptr = seq_idx_ptr_base + pid_b * stride_seq_idx_batch
 
-        offs_m = pid_m * BLOCK_SIZE_SP + tl.arange(0, BLOCK_SIZE_SP)
+        offs_m = pid_m * BLOCK_SIZE_MN + tl.arange(0, BLOCK_SIZE_MN)
         states_ptrs = states_ptr + offs_m * stride_states_dim
         out_ptrs = out_ptr + offs_m * stride_out_dim
         final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
 
         if not HAS_INITSTATES:
-            states = tl.zeros((BLOCK_SIZE_SP, ), dtype=tl.float32)
+            states = tl.zeros((BLOCK_SIZE_MN, ), dtype=tl.float32)
         else:
             initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
             states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)

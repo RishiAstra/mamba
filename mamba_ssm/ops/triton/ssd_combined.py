@@ -288,13 +288,13 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
         # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 64*128}, num_stages=3, num_warps=32), # BLOCK_SIZE_MN must be BLOCK_SIZE_M * BLOCK_SIZE_N
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 64*32}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 32*64}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 64*64}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
         # new config to only split hdim
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_MN': 32*128}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'dim'],
 )
@@ -320,21 +320,17 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
 
     # Pointers to matrices
     out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr,
-    # Matrix dimensions
-    dim,
     # Strides
-    stride_states_dim,
-    stride_out_batch, stride_out_chunk, stride_out_head, stride_out_dim,
-    stride_final_states_batch, stride_final_states_head, stride_final_states_dim,
+    stride_out_batch, stride_out_chunk, stride_out_head, stride_out_hdim, stride_out_dstate,
+    stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
     offset_dA_cs_last_elem,
-    stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
+    stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
 
     # Meta-parameters
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
-    BLOCK_SIZE_MN: tl.constexpr,
 ):
     grid_dim_headdim = tl.cdiv(hdim, BLOCK_SIZE_M)
     grid_dim_dstate = tl.cdiv(dstate, BLOCK_SIZE_N)
@@ -435,8 +431,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     # # we use this combined dim, but restrict the block size to be the same as step 1
     # BLOCK_SIZE_SP = BLOCK_SIZE_M * BLOCK_SIZE_N
 
-    grid_dim_dim = tl.cdiv(dim, BLOCK_SIZE_MN)
-    target_grid_size2 = grid_dim_dim * batch * nheads
+    target_grid_size2 = batch * nheads * (grid_dim_headdim * grid_dim_dstate)
 
     dA_cs_ptr_base = dA_cs_ptr + offset_dA_cs_last_elem
     out_ptr_base = out_ptr
@@ -451,7 +446,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     while(my_block_id < target_grid_size2):
         pid_h = my_block_id % nheads
         pid_b = (my_block_id // nheads) % batch
-        pid_m = (my_block_id // (nheads * batch)) # last one doesn't need mod
+        pid_n = (my_block_id // (nheads * batch)) % grid_dim_dstate
+        pid_m = (my_block_id // (nheads * batch * grid_dim_dstate)) # % grid_dim_headdim # don't need last mod
 
 
         states_ptr = states_ptr_base + pid_b * stride_states_batch + pid_h * stride_states_head
@@ -463,22 +459,23 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
         if HAS_SEQ_IDX:
             seq_idx_ptr = seq_idx_ptr_base + pid_b * stride_seq_idx_batch
 
-        offs_m = pid_m * BLOCK_SIZE_MN + tl.arange(0, BLOCK_SIZE_MN)
-        states_ptrs = states_ptr + offs_m * stride_states_dim
-        out_ptrs = out_ptr + offs_m * stride_out_dim
-        final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        states_ptrs = states_ptr + (offs_m[:, None] * stride_states_hdim + offs_n[None, :] * stride_states_dstate)
+        out_ptrs = out_ptr + (offs_m[:, None] * stride_out_hdim + offs_n[None, :] * stride_out_dstate)
+        final_states_ptrs = final_states_ptr + (offs_m[:, None] * stride_final_states_hdim + offs_n[None, :] * stride_final_states_dstate)
 
         if not HAS_INITSTATES:
-            states = tl.zeros((BLOCK_SIZE_MN, ), dtype=tl.float32)
+            states = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         else:
-            initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
-            states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-        tl.store(out_ptrs, states, mask=offs_m < dim)
+            initstates_ptrs = initstates_ptr + (offs_m[:, None] * stride_initstates_hdim + offs_n[None, :] * stride_initstates_dstate)
+            states = tl.load(initstates_ptrs, mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
+        tl.store(out_ptrs, states, mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate))
         out_ptrs += stride_out_chunk
         seq_idx = 0
         # for c in range(nchunks):
         for c in tl.range(nchunks, num_stages=2):
-            new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            new_states = tl.load(states_ptrs, mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
             dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
             scale = tl.exp(dA_cs)
             if HAS_SEQ_IDX:
@@ -487,9 +484,9 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
                 seq_idx = seq_idx_new
             states = scale * states + new_states
             if c < nchunks - 1:
-                tl.store(out_ptrs, states, mask=offs_m < dim)
+                tl.store(out_ptrs, states, mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate))
             else:
-                tl.store(final_states_ptrs, states, mask=offs_m < dim)
+                tl.store(final_states_ptrs, states, mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate))
             states_ptrs += stride_states_chunk
             dA_cs_ptr += stride_dA_cs_chunk
             out_ptrs += stride_out_chunk
@@ -554,13 +551,11 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
 
             out, final_states, dA_cumsum, initial_states,
-            dim, # TODO: can be simplified
-            states.stride(-1), # TODO: can be simplified
-            out.stride(0), out.stride(1), out.stride(2), out.stride(4),
-            final_states.stride(0), final_states.stride(1), final_states.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+            final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
             dA_cumsum.stride(-1) * (chunk_size - 1), # offset to index into the last element along last dim
-            *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(3))
-              if initial_states is not None else (0, 0, 0)),
+            *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3))
+                if initial_states is not None else (0, 0, 0, 0)),
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
         )

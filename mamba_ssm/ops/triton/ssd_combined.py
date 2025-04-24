@@ -282,15 +282,15 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
 # this is just a basic combo of the original chunk_state and state_passing configs
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_SP': 1024}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 256 }, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 512 }, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 256 }, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 128 }, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 128 }, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 64  }, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 64  }, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 128 }, num_stages=4, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'dim'],
 )
@@ -377,7 +377,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             seq_idx_last = tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
+        # for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
+        for k in tl.range(0, chunk_size_limit, BLOCK_SIZE_K, num_stages=4):
             x = tl.load(x_ptrs, mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k), other=0.0)
             b = tl.load(b_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
             dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0).to(tl.float32)
@@ -461,7 +462,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
         tl.store(out_ptrs, states, mask=offs_m < dim)
         out_ptrs += stride_out_chunk
         seq_idx = 0
-        for c in range(nchunks):
+        # for c in range(nchunks):
+        for c in tl.range(nchunks, num_stages=2):
             new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
             dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
             scale = tl.exp(dA_cs)

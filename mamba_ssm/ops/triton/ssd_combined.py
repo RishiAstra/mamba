@@ -347,11 +347,11 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
 
     while(my_block_id < target_grid_size):
-        pid_h = my_block_id % nheads
-        pid_b = (my_block_id // nheads) % batch
-        pid_c = (my_block_id // (nheads * batch)) % nchunks
-        pid_n = (my_block_id // (nheads * batch * nchunks)) % grid_dim_dstate
-        pid_m = (my_block_id // (nheads * batch * nchunks * grid_dim_dstate)) # % grid_dim_headdim # don't need last mod
+        pid_c = my_block_id % nchunks
+        pid_n = (my_block_id // nchunks) % grid_dim_dstate
+        pid_m = (my_block_id // (nchunks * grid_dim_dstate)) % grid_dim_headdim
+        pid_h = (my_block_id // (nchunks * grid_dim_dstate * grid_dim_headdim)) % nheads
+        pid_b = (my_block_id // (nchunks * grid_dim_dstate * grid_dim_headdim * nheads)) % batch
 
 
         b_ptr   = b_ptr_base + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head

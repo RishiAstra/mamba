@@ -303,7 +303,9 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     grid_atomic,
     grid_atomic2,
     chunk_work_done,
-    grid_size_SMs,
+    # grid_size_SMs,
+    min_concurrent_threadblocks,
+
     # Pointers to matrices
     x_ptr, b_ptr, states_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
     # Matrix dimensions
@@ -345,11 +347,15 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
         seq_idx_ptr_base = seq_idx_ptr
     states_ptr_base = states_ptr
 
-    should_do_step1 = tl.program_id(0) < (grid_size_SMs * 15/16)
+    # TODO: set a good number or add to config, the number of threadblocks to skip to step 2
+    # must be less than the number of concurrent threadblocks to avoid deadlocks
+    should_do_step1 = tl.program_id(0) > 8# < (grid_size_SMs * 15/16)
     if should_do_step1:
         my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
 
         while(my_block_id < target_grid_size):
+            # my_block_id = tl.program_id(0)
+
             pid_c = my_block_id % nchunks
             pid_n = (my_block_id // nchunks) % grid_dim_dstate
             pid_m = (my_block_id // (nchunks * grid_dim_dstate)) % grid_dim_headdim
@@ -435,84 +441,87 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
     # # we use this combined dim, but restrict the block size to be the same as step 1
     # BLOCK_SIZE_SP = BLOCK_SIZE_M * BLOCK_SIZE_N
 
-    dim = hdim * dstate
-    grid_dim_dim = tl.cdiv(dim, BLOCK_SIZE_SP)
-    target_grid_size2 = grid_dim_dim * batch * nheads
+    # must either be a skip or one of the last concurrent blocks to avoid deadlock
+    should_do_step2 = not should_do_step1 # or (min_concurrent_threadblocks - tl.program_id(0)) < tl.num_programs(0) 
+    if should_do_step2:
+        dim = hdim * dstate
+        grid_dim_dim = tl.cdiv(dim, BLOCK_SIZE_SP)
+        target_grid_size2 = grid_dim_dim * batch * nheads
 
-    dA_cs_ptr_base = dA_cs_ptr + offset_dA_cs_last_elem
-    out_ptr_base = out_ptr
-    final_states_ptr_base = final_states_ptr
-    if HAS_INITSTATES:
-        initstates_ptr_base = initstates_ptr
-    if HAS_SEQ_IDX:
-        seq_idx_ptr_base = seq_idx_ptr
-
-    my_block_id = tl.atomic_add(grid_atomic2, 1).to(tl.int32)
-
-    while(my_block_id < target_grid_size2):
-
-        pid_h = my_block_id % nheads
-        pid_b = (my_block_id // nheads) % batch
-        pid_dim = (my_block_id // (nheads * batch)) # % grid_dim_dim # don't need last mod
-        # pid_n = (my_block_id // (nheads * batch)) % grid_dim_dstate
-        # pid_m = (my_block_id // (nheads * batch * grid_dim_dstate)) # % grid_dim_headdim # don't need last mod
-
-
-        # instead of the global barrier, we only need to check that all chunks were processed in step 1.
-        # just check chunk_work_done batch, nheads, nchunks along the c dimension
-        # really sus-looking spin wait
-        # work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + tl.arange(0, nchunks), 0)
-        # # check if any too small
-        # all_work_done = tl.min(work_done) == 1 # TODO: doesn't seem to work in the condition of the for loop directly??
-        # while (not all_work_done):
-        #     work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + tl.arange(0, nchunks), 0)#, mask=work_done < 1)
-        #     all_work_done = tl.min(work_done) == 1
-        work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0)
-        work_needed = nchunks * grid_dim_headdim * grid_dim_dstate # TODO: don't bunch up by these 2 grid dim
-        while (work_done < work_needed):
-            work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0)
-
-
-        states_ptr = states_ptr_base + pid_b * stride_states_batch + pid_h * stride_states_head
-        dA_cs_ptr  = dA_cs_ptr_base + pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
-        out_ptr    = out_ptr_base + pid_b * stride_out_batch + pid_h * stride_out_head
-        final_states_ptr = final_states_ptr_base + pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+        dA_cs_ptr_base = dA_cs_ptr + offset_dA_cs_last_elem
+        out_ptr_base = out_ptr
+        final_states_ptr_base = final_states_ptr
         if HAS_INITSTATES:
-            initstates_ptr = initstates_ptr_base + pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+            initstates_ptr_base = initstates_ptr
         if HAS_SEQ_IDX:
-            seq_idx_ptr = seq_idx_ptr_base + pid_b * stride_seq_idx_batch
+            seq_idx_ptr_base = seq_idx_ptr
 
-        offs_dim = pid_dim * BLOCK_SIZE_SP + tl.arange(0, BLOCK_SIZE_SP)
-        states_ptrs = states_ptr + offs_dim * stride_states_dim
-        out_ptrs = out_ptr + offs_dim * stride_out_dim
-        final_states_ptrs = final_states_ptr + offs_dim * stride_final_states_dim
-
-        if not HAS_INITSTATES:
-            states = tl.zeros((BLOCK_SIZE_SP, ), dtype=tl.float32)
-        else:
-            initstates_ptrs = initstates_ptr + offs_dim * stride_initstates_dim
-            states = tl.load(initstates_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
-        tl.store(out_ptrs, states, mask=offs_dim < dim)
-        out_ptrs += stride_out_chunk
-        seq_idx = 0
-        # for c in range(nchunks):
-        for c in tl.range(nchunks, num_stages=2):
-            new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
-            dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
-            scale = tl.exp(dA_cs)
-            if HAS_SEQ_IDX:
-                seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
-                seq_idx = seq_idx_new
-            states = scale * states + new_states
-            if c < nchunks - 1:
-                tl.store(out_ptrs, states, mask=offs_dim < dim)
-            else:
-                tl.store(final_states_ptrs, states, mask=offs_dim < dim)
-            states_ptrs += stride_states_chunk
-            dA_cs_ptr += stride_dA_cs_chunk
-            out_ptrs += stride_out_chunk
         my_block_id = tl.atomic_add(grid_atomic2, 1).to(tl.int32)
+
+        while(my_block_id < target_grid_size2):
+
+            pid_h = my_block_id % nheads
+            pid_b = (my_block_id // nheads) % batch
+            pid_dim = (my_block_id // (nheads * batch)) # % grid_dim_dim # don't need last mod
+            # pid_n = (my_block_id // (nheads * batch)) % grid_dim_dstate
+            # pid_m = (my_block_id // (nheads * batch * grid_dim_dstate)) # % grid_dim_headdim # don't need last mod
+
+
+            # instead of the global barrier, we only need to check that all chunks were processed in step 1.
+            # just check chunk_work_done batch, nheads, nchunks along the c dimension
+            # really sus-looking spin wait
+            # work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + tl.arange(0, nchunks), 0)
+            # # check if any too small
+            # all_work_done = tl.min(work_done) == 1 # TODO: doesn't seem to work in the condition of the for loop directly??
+            # while (not all_work_done):
+            #     work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + tl.arange(0, nchunks), 0)#, mask=work_done < 1)
+            #     all_work_done = tl.min(work_done) == 1
+            work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0)
+            work_needed = nchunks * grid_dim_headdim * grid_dim_dstate # TODO: don't bunch up by these 2 grid dim
+            while (work_done < work_needed):
+                work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0)
+
+
+            states_ptr = states_ptr_base + pid_b * stride_states_batch + pid_h * stride_states_head
+            dA_cs_ptr  = dA_cs_ptr_base + pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
+            out_ptr    = out_ptr_base + pid_b * stride_out_batch + pid_h * stride_out_head
+            final_states_ptr = final_states_ptr_base + pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+            if HAS_INITSTATES:
+                initstates_ptr = initstates_ptr_base + pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+            if HAS_SEQ_IDX:
+                seq_idx_ptr = seq_idx_ptr_base + pid_b * stride_seq_idx_batch
+
+            offs_dim = pid_dim * BLOCK_SIZE_SP + tl.arange(0, BLOCK_SIZE_SP)
+            states_ptrs = states_ptr + offs_dim * stride_states_dim
+            out_ptrs = out_ptr + offs_dim * stride_out_dim
+            final_states_ptrs = final_states_ptr + offs_dim * stride_final_states_dim
+
+            if not HAS_INITSTATES:
+                states = tl.zeros((BLOCK_SIZE_SP, ), dtype=tl.float32)
+            else:
+                initstates_ptrs = initstates_ptr + offs_dim * stride_initstates_dim
+                states = tl.load(initstates_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
+            tl.store(out_ptrs, states, mask=offs_dim < dim)
+            out_ptrs += stride_out_chunk
+            seq_idx = 0
+            # for c in range(nchunks):
+            for c in tl.range(nchunks, num_stages=2):
+                new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
+                dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
+                scale = tl.exp(dA_cs)
+                if HAS_SEQ_IDX:
+                    seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+                    scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+                    seq_idx = seq_idx_new
+                states = scale * states + new_states
+                if c < nchunks - 1:
+                    tl.store(out_ptrs, states, mask=offs_dim < dim)
+                else:
+                    tl.store(final_states_ptrs, states, mask=offs_dim < dim)
+                states_ptrs += stride_states_chunk
+                dA_cs_ptr += stride_dA_cs_chunk
+                out_ptrs += stride_out_chunk
+            my_block_id = tl.atomic_add(grid_atomic2, 1).to(tl.int32)
 
 
 
@@ -552,17 +561,21 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
 
     # grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
     #                 batch * nchunks, nheads)
-    actual_grid_size_raw = torch.cuda.get_device_properties("cuda").multi_processor_count
-    actual_grid_size = lambda META: (actual_grid_size_raw,) # TODO: in all this new code, I hardcoded device "cuda"
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']) * batch * nchunks * nheads, )
+    # grid = lambda META: (sm_count,)
+    # actual_grid_size_raw = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # actual_grid_size = lambda META: (actual_grid_size_raw,) # TODO: in all this new code, I hardcoded device "cuda"
     grid_atomic = torch.zeros((1), device="cuda")
     grid_atomic2 = torch.zeros((1), device="cuda")
     chunk_work_done = torch.zeros((batch, nheads), dtype=torch.int32, device="cuda") # TODO: could probably be int8
     with torch.cuda.device(x.device.index):
-        _fused_chunk_state_state_passing_fwd_kernel_persistent[actual_grid_size](
+        _fused_chunk_state_state_passing_fwd_kernel_persistent[grid](#actual_grid_size](
             grid_atomic,
             grid_atomic2,
             chunk_work_done,
-            actual_grid_size_raw,
+            # actual_grid_size_raw,
+            sm_count, # min concurrent threadblocks, we know that at least this many threadblocks can run concurrently
 
             x, B, states, dt, dA_cumsum, seq_idx,
             headdim, dstate, chunk_size,

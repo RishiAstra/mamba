@@ -288,13 +288,22 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
         # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
-        # new config to only split hdim
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096}, num_stages=3, num_warps=32),
+        # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        # triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
+        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N':  32, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N':  64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N':  64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'dim'],
 )
@@ -331,7 +340,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
 
     # Meta-parameters
     HAS_SEQ_IDX: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_SP: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_SP: tl.constexpr, SKIP_THREADBLOCK_COUNT: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
 ):
@@ -349,12 +358,12 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
 
     # TODO: set a good number or add to config, the number of threadblocks to skip to step 2
     # must be less than the number of concurrent threadblocks to avoid deadlocks
-    should_do_step1 = tl.program_id(0) > 8# < (grid_size_SMs * 15/16)
+    should_do_step1 = tl.program_id(0) >= SKIP_THREADBLOCK_COUNT# < (grid_size_SMs * 15/16)
     if should_do_step1:
-        my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
+        # my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
 
-        while(my_block_id < target_grid_size):
-            # my_block_id = tl.program_id(0)
+        # while(my_block_id < target_grid_size):
+            my_block_id = tl.program_id(0)
 
             pid_c = my_block_id % nchunks
             pid_n = (my_block_id // nchunks) % grid_dim_dstate
@@ -386,8 +395,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
                 seq_idx_last = tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
             acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-            # for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
-            for k in tl.range(0, chunk_size_limit, BLOCK_SIZE_K, num_stages=4):
+            for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
+            # for k in tl.range(0, chunk_size_limit, BLOCK_SIZE_K, num_stages=4):
                 x = tl.load(x_ptrs, mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k), other=0.0)
                 b = tl.load(b_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0).to(tl.float32)
@@ -416,7 +425,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             c_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
             tl.store(states_ptrs, states, mask=c_mask)
 
-            my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
+            # my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
             tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 1) # mark work as done
 
     
@@ -504,8 +513,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             tl.store(out_ptrs, states, mask=offs_dim < dim)
             out_ptrs += stride_out_chunk
             seq_idx = 0
-            # for c in range(nchunks):
-            for c in tl.range(nchunks, num_stages=2):
+            for c in range(nchunks):
+            # for c in tl.range(nchunks, num_stages=2):
                 new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
                 dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
                 scale = tl.exp(dA_cs)
@@ -562,7 +571,9 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
     # grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
     #                 batch * nchunks, nheads)
     sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
-    grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']) * batch * nchunks * nheads, )
+    # TODO: should probably be part of configs or something
+    # step2_count = 8
+    grid = lambda META: (META['SKIP_THREADBLOCK_COUNT'] + triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']) * batch * nchunks * nheads, )
     # grid = lambda META: (sm_count,)
     # actual_grid_size_raw = torch.cuda.get_device_properties("cuda").multi_processor_count
     # actual_grid_size = lambda META: (actual_grid_size_raw,) # TODO: in all this new code, I hardcoded device "cuda"
@@ -576,6 +587,7 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
             chunk_work_done,
             # actual_grid_size_raw,
             sm_count, # min concurrent threadblocks, we know that at least this many threadblocks can run concurrently
+            # step2_count,
 
             x, B, states, dt, dA_cumsum, seq_idx,
             headdim, dstate, chunk_size,

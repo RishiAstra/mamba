@@ -363,7 +363,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
         # my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
 
         # while(my_block_id < target_grid_size):
-            my_block_id = tl.program_id(0)
+            my_block_id = tl.program_id(0) - SKIP_THREADBLOCK_COUNT
 
             pid_c = my_block_id % nchunks
             pid_n = (my_block_id // nchunks) % grid_dim_dstate

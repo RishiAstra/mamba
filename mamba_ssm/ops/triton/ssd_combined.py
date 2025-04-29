@@ -299,11 +299,15 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
         # triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
         # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
         # triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 32}, num_stages=1, num_warps=16),
-        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N':  32, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N':  64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N':  64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+
+        triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 128//2, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 1024, 'SKIP_THREADBLOCK_COUNT': 128}, num_stages=1, num_warps=8),
+        # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N':  32, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        # triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N':  64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N':  64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+        # triton.Config({'BLOCK_SIZE_M': 32//2,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 4096, 'SKIP_THREADBLOCK_COUNT': 64}, num_stages=1, num_warps=8),
+
+        # best config so far at 2.49ms is:
+        # triton.Config({'BLOCK_SIZE_M': 64//2,  'BLOCK_SIZE_N': 128//2, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_SP': 1024, 'SKIP_THREADBLOCK_COUNT': 384}, num_stages=1, num_warps=8),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'dim'],
 )
@@ -371,6 +375,12 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             pid_h = (my_block_id // (nchunks * grid_dim_dstate * grid_dim_headdim)) % nheads
             pid_b = (my_block_id // (nchunks * grid_dim_dstate * grid_dim_headdim * nheads)) % batch
 
+            # wait for less than 4 work
+            max_work = hdim * dstate * nchunks * 4
+            cur_work = tl.atomic_add(grid_atomic, 0)
+            while cur_work >= max_work: # spin till sem below max_work
+                cur_work = tl.atomic_add(grid_atomic, 0)
+
 
             b_ptr   = b_ptr_base + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
             x_ptr   = x_ptr_base + pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
@@ -397,8 +407,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
             for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
             # for k in tl.range(0, chunk_size_limit, BLOCK_SIZE_K, num_stages=4):
-                x = tl.load(x_ptrs, mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k), other=0.0)
-                b = tl.load(b_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
+                x = tl.load(x_ptrs, mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k), other=0.0, cache_modifier=".cv")
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate), other=0.0, cache_modifier=".cv").to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0).to(tl.float32)
                 if HAS_SEQ_IDX:
                     seq_idx_k = tl.load(seq_idx_ptrs, mask=offs_k < chunk_size_limit - k, other=-1)
@@ -423,10 +433,11 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             states_ptrs = states_ptr + (offs_m[:, None] * stride_states_hdim + offs_n[None, :] * stride_states_dstate)
             c_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
-            tl.store(states_ptrs, states, mask=c_mask)
+            tl.store(states_ptrs, states, mask=c_mask, cache_modifier=".cg")
 
             # my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
             tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 1) # mark work as done
+            tl.atomic_add(grid_atomic, BLOCK_SIZE_M * BLOCK_SIZE_N) # sem down
 
     
     # # busy wait for global barrier, this is ok since we're in a persistent kernel
@@ -468,12 +479,16 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
         my_block_id = tl.atomic_add(grid_atomic2, 1).to(tl.int32)
 
         while(my_block_id < target_grid_size2):
+        # if my_block_id < target_grid_size2:
 
-            pid_h = my_block_id % nheads
-            pid_b = (my_block_id // nheads) % batch
-            pid_dim = (my_block_id // (nheads * batch)) # % grid_dim_dim # don't need last mod
-            # pid_n = (my_block_id // (nheads * batch)) % grid_dim_dstate
-            # pid_m = (my_block_id // (nheads * batch * grid_dim_dstate)) # % grid_dim_headdim # don't need last mod
+            # pid_h = my_block_id % nheads
+            # pid_b = (my_block_id // nheads) % batch
+            # pid_dim = (my_block_id // (nheads * batch)) # % grid_dim_dim # don't need last mod
+            # # pid_n = (my_block_id // (nheads * batch)) % grid_dim_dstate
+            # # pid_m = (my_block_id // (nheads * batch * grid_dim_dstate)) # % grid_dim_headdim # don't need last mod
+            pid_dim = my_block_id % grid_dim_dim
+            pid_h = (my_block_id // grid_dim_dim) % nheads
+            pid_b = (my_block_id // (grid_dim_dim * nheads)) % batch
 
 
             # instead of the global barrier, we only need to check that all chunks were processed in step 1.
@@ -515,7 +530,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             seq_idx = 0
             for c in range(nchunks):
             # for c in tl.range(nchunks, num_stages=2):
-                new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
+                new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0, cache_modifier=".cv").to(tl.float32)
                 dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
                 scale = tl.exp(dA_cs)
                 if HAS_SEQ_IDX:
@@ -524,13 +539,15 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
                     seq_idx = seq_idx_new
                 states = scale * states + new_states
                 if c < nchunks - 1:
-                    tl.store(out_ptrs, states, mask=offs_dim < dim)
+                    tl.store(out_ptrs, states, mask=offs_dim < dim, cache_modifier=".wt")
                 else:
-                    tl.store(final_states_ptrs, states, mask=offs_dim < dim)
+                    tl.store(final_states_ptrs, states, mask=offs_dim < dim, cache_modifier=".wt")
                 states_ptrs += stride_states_chunk
                 dA_cs_ptr += stride_dA_cs_chunk
                 out_ptrs += stride_out_chunk
+
             my_block_id = tl.atomic_add(grid_atomic2, 1).to(tl.int32)
+            tl.atomic_add(grid_atomic, -nchunks * BLOCK_SIZE_SP)
 
 
 
@@ -613,6 +630,16 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
 
 
 def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
+    # # temp print all input sizes
+    # # print(f"B: {B.shape}, x: {x.shape}, dt: {dt.shape}, dA_cumsum: {dA_cumsum.shape}, chunk_size: {chunk_size}, dstate: {dstate}, hdim: {headdim}, nheads: {nheads}, ngroups: {ngroups}, C.dtype: {C.dtype}")
+    # # print(f"dtypes: B: {B.dtype}, x: {x.dtype}, dt: {dt.dtype}, dA_cumsum: {dA_cumsum.dtype}, C: {C.dtype}")
+    # # dt, dt_bias, A, B, C, D, x, chunk_size
+    # print(f"dt: {dt.shape}, dt_bias: {dt_bias.shape}, A: {A.shape}, B: {B.shape}, C: {C.shape}, D: {D.shape if D is not None else None}, x: {x.shape}, chunk_size: {chunk_size}")
+    # print(f"dtypes: dt: {dt.dtype}, dt_bias: {dt_bias.dtype if dt_bias is not None else None}, A: {A.dtype}, B: {B.dtype}, C: {C.dtype}, D: {D.dtype if D is not None else None}, x: {x.dtype}")
+    # # exit
+    # exit(0)
+
+
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -639,31 +666,45 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         D = D.contiguous()
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
+
+    # # original
+
     # # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
     # # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # # dA_cumsum_tmp2, dt_tmp2 = _chunk_cumsum_fwd(dt[:, 147:256], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
-    # dA_cumsum, dt = _chunk_cumsum_fwd_persistent(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-    # states = _chunk_state_fwd_persistent(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+    # dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
+    # states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
     # # states_tmp0 = _chunk_state_fwd(B[:, :147], x[:, :147], dt_tmp0, dA_cumsum_tmp0, states_in_fp32=True)
     # # states_tmp1 = _chunk_state_fwd(B[:, 147:], x[:, 147:], dt_tmp1, dA_cumsum_tmp1, states_in_fp32=True)
     # # states_tmp2 = _chunk_state_fwd(B[:, 147:256], x[:, 147:256], dt_tmp2, dA_cumsum_tmp2, states_in_fp32=True)
-    # states, final_states = _state_passing_fwd_persistent(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
+    # states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
     #                                           initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
     #                                           seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
     # states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
     # # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
-    # CB = _bmm_chunk_fwd_persistent(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    # out, out_x = _chunk_scan_fwd_persistent(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    # CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    # out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
 
-    dA_cumsum, dt = _chunk_cumsum_fwd_persistent(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-    CB = _bmm_chunk_fwd_persistent(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
 
-    # states = _chunk_state_fwd_persistent(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-    # states, final_states = _state_passing_fwd_persistent_gooddims(states, dA_cumsum, initial_states=initial_states, seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
+
+    # fused, others original
+    # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
+    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
     states, final_states = _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, C.dtype, initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True)
-    out, out_x = _chunk_scan_fwd_persistent(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+
+
+
+    # # fused, others persistent
+    # dA_cumsum, dt = _chunk_cumsum_fwd_persistent(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
+    # CB = _bmm_chunk_fwd_persistent(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    # # states = _chunk_state_fwd_persistent(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+    # # states, final_states = _state_passing_fwd_persistent_gooddims(states, dA_cumsum, initial_states=initial_states, seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
+    # states, final_states = _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, C.dtype, initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True)
+    # out, out_x = _chunk_scan_fwd_persistent(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
 
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states

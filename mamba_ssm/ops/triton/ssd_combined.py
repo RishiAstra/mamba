@@ -372,14 +372,23 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             pid_c = my_block_id % nchunks
             pid_n = (my_block_id // nchunks) % grid_dim_dstate
             pid_m = (my_block_id // (nchunks * grid_dim_dstate)) % grid_dim_headdim
+            # pid_n = my_block_id % grid_dim_dstate
+            # pid_m = (my_block_id // grid_dim_dstate) % grid_dim_headdim
+            # pid_c = (my_block_id // (grid_dim_dstate * grid_dim_headdim)) % nchunks
             pid_h = (my_block_id // (nchunks * grid_dim_dstate * grid_dim_headdim)) % nheads
             pid_b = (my_block_id // (nchunks * grid_dim_dstate * grid_dim_headdim * nheads)) % batch
+            # pid_b = (my_block_id) // (nchunks * grid_dim_dstate * grid_dim_headdim * nheads)
+            # pid_h = (my_block_id - pid_b * (nchunks * grid_dim_dstate * grid_dim_headdim * nheads)) // (nchunks * grid_dim_dstate * grid_dim_headdim)
+            # pid_m = (my_block_id - pid_b * (nchunks * grid_dim_dstate * grid_dim_headdim * nheads) - pid_h * (nchunks * grid_dim_dstate * grid_dim_headdim)) // (nchunks * grid_dim_dstate)
+            # pid_n = (my_block_id - pid_b * (nchunks * grid_dim_dstate * grid_dim_headdim * nheads) - pid_h * (nchunks * grid_dim_dstate * grid_dim_headdim) - pid_m * (nchunks)) // (nchunks)
+            # pid_c = (my_block_id - pid_b * (nchunks * grid_dim_dstate * grid_dim_headdim * nheads) - pid_h * (nchunks * grid_dim_dstate * grid_dim_headdim) - pid_m * (nchunks) - pid_n * (nchunks))
 
             # wait for less than 4 work
-            max_work = hdim * dstate * nchunks * 4
-            cur_work = tl.atomic_add(grid_atomic, 0)
+            # this is only used to limit L2 cache pressure, not for sync, so can be relaxed
+            max_work = hdim * dstate * nchunks * 5
+            cur_work = tl.atomic_add(grid_atomic, 0, sem="relaxed")
             while cur_work >= max_work: # spin till sem below max_work
-                cur_work = tl.atomic_add(grid_atomic, 0)
+                cur_work = tl.atomic_add(grid_atomic, 0, sem="relaxed")
 
 
             b_ptr   = b_ptr_base + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
@@ -407,8 +416,8 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
             for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
             # for k in tl.range(0, chunk_size_limit, BLOCK_SIZE_K, num_stages=4):
-                x = tl.load(x_ptrs, mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k), other=0.0, cache_modifier=".cv")
-                b = tl.load(b_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate), other=0.0, cache_modifier=".cv").to(tl.float32)
+                x = tl.load(x_ptrs, mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k), other=0.0)
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0).to(tl.float32)
                 if HAS_SEQ_IDX:
                     seq_idx_k = tl.load(seq_idx_ptrs, mask=offs_k < chunk_size_limit - k, other=-1)
@@ -437,6 +446,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
 
             # my_block_id = tl.atomic_add(grid_atomic, 1).to(tl.int32)
             tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 1) # mark work as done
+            # tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + pid_c, 1)
             tl.atomic_add(grid_atomic, BLOCK_SIZE_M * BLOCK_SIZE_N) # sem down
 
     
@@ -500,10 +510,10 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             # while (not all_work_done):
             #     work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + tl.arange(0, nchunks), 0)#, mask=work_done < 1)
             #     all_work_done = tl.min(work_done) == 1
-            work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0)
+            work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0, sem="acquire")
             work_needed = nchunks * grid_dim_headdim * grid_dim_dstate # TODO: don't bunch up by these 2 grid dim
             while (work_done < work_needed):
-                work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0)
+                work_done = tl.atomic_add(chunk_work_done + pid_b * nheads + pid_h, 0, sem="acquire")
 
 
             states_ptr = states_ptr_base + pid_b * stride_states_batch + pid_h * stride_states_head
@@ -525,12 +535,17 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
             else:
                 initstates_ptrs = initstates_ptr + offs_dim * stride_initstates_dim
                 states = tl.load(initstates_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
-            tl.store(out_ptrs, states, mask=offs_dim < dim)
+            tl.store(out_ptrs, states, mask=offs_dim < dim, cache_modifier=".wt")
             out_ptrs += stride_out_chunk
             seq_idx = 0
             for c in range(nchunks):
             # for c in tl.range(nchunks, num_stages=2):
-                new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0, cache_modifier=".cv").to(tl.float32)
+                # work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + c, 0)
+                # work_needed = grid_dim_headdim * grid_dim_dstate # TODO: don't bunch up by these 2 grid dim
+                # while (work_done < work_needed):
+                #     work_done = tl.atomic_add(chunk_work_done + pid_b * nheads * nchunks + pid_h * nchunks + c, 0)
+
+                new_states = tl.load(states_ptrs, mask=offs_dim < dim, other=0.0).to(tl.float32)
                 dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
                 scale = tl.exp(dA_cs)
                 if HAS_SEQ_IDX:
@@ -545,6 +560,7 @@ def _fused_chunk_state_state_passing_fwd_kernel_persistent(
                 states_ptrs += stride_states_chunk
                 dA_cs_ptr += stride_dA_cs_chunk
                 out_ptrs += stride_out_chunk
+                # tl.atomic_add(grid_atomic, -BLOCK_SIZE_SP) # sem down
 
             my_block_id = tl.atomic_add(grid_atomic2, 1).to(tl.int32)
             tl.atomic_add(grid_atomic, -nchunks * BLOCK_SIZE_SP)
@@ -597,6 +613,7 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
     grid_atomic = torch.zeros((1), device="cuda")
     grid_atomic2 = torch.zeros((1), device="cuda")
     chunk_work_done = torch.zeros((batch, nheads), dtype=torch.int32, device="cuda") # TODO: could probably be int8
+    # chunk_work_done = torch.zeros((batch, nheads, nchunks), dtype=torch.int32, device="cuda") # TODO: could probably be int8
     with torch.cuda.device(x.device.index):
         _fused_chunk_state_state_passing_fwd_kernel_persistent[grid](#actual_grid_size](
             grid_atomic,

@@ -17,13 +17,19 @@ def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
     # return out, out_x, dt, dA_cumsum, states, final_states
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, use_fused=True)
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, method='fused')
+    return outputs[0]
+    # return out, out_x, dt, dA_cumsum, states, final_states
+
+def run_fullyfused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, method='fullyfused')
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
     (run_fused_ssd, "Fused", "red"),
+    (run_fullyfused_ssd, "Fully Fused", "green"),
 ]
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -54,7 +60,7 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 3)
+    (get_test_size(1024 * 2 ** i),) for i in range(0, 7)
 ]
 
 configs.append(

@@ -11,6 +11,7 @@ from packaging import version
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from mamba_ssm.ops.triton.ssd_fused import _fused3_ssd
 from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 
 import triton
@@ -646,7 +647,7 @@ def _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, out_dty
 
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused=False):
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), method=None):
     # # temp print all input sizes
     # # print(f"B: {B.shape}, x: {x.shape}, dt: {dt.shape}, dA_cumsum: {dA_cumsum.shape}, chunk_size: {chunk_size}, dstate: {dstate}, hdim: {headdim}, nheads: {nheads}, ngroups: {ngroups}, C.dtype: {C.dtype}")
     # # print(f"dtypes: B: {B.dtype}, x: {x.dtype}, dt: {dt.dtype}, dA_cumsum: {dA_cumsum.dtype}, C: {C.dtype}")
@@ -685,14 +686,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
 
-    if use_fused:
-        # fused, others original
-        # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
-        CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-        dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-        states, final_states = _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, C.dtype, initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True)
-        out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
-    else:
+    if method is None:
         # original
         dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
         states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
@@ -702,6 +696,23 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
         CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
         out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    elif method == 'fused':
+        # fused, others original
+        CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+        dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
+        states, final_states = _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, C.dtype, initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True)
+        out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    elif method == 'fullyfused':
+        # all 3 big kernels fused
+        CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+        dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
+        out, out_x, states, final_states = _fused3_ssd(
+            C, B, CB, x, dt, dA_cumsum, C.dtype, D, 
+            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z
+        )
+    else:
+        print(f"Bad ssd method: {method}")
+        exit(1)
 
 
     # # fused, others persistent

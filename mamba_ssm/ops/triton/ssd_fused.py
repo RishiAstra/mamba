@@ -398,9 +398,9 @@ def _chunk_scan_fwd_kernel_new(
     # 5 pids, same for all 3 parts
     # all pids represent domain parallelism except pid_c for state passing
     pid = tl.program_id(0)
-    num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
+    num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS) // 2 # TODO: see below
     num_pid_cs = tl.cdiv(chunk_size, BLOCK_SIZE_CS)
-    num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
+    num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD) * 2 # TODO: fix, need separate block size somehow, maybe a mult, maybe in autotune
     # TODO: add pid_ds, remove pid_cs
     # pid_cs = pid % num_pid_cs
     # pid_hd = (pid // num_pid_cs) % num_pid_hd
@@ -421,8 +421,10 @@ def _chunk_scan_fwd_kernel_new(
     pid_b = (pid // (num_pid_ds * num_pid_hd * nheads * nchunks)) % batch
 
     # only 1 pid_ds, half the pid_hd
-    if pid_hd % 2 == 1 or pid_ds != 0:
-        return
+    # to handle this, we put the extra along the pid_cs which doesn't exist
+    # this way, we use the exact same grid without any early returns
+    # in return for possbily pad tail SM utilization for effective pid_cs > num_pid_cs
+    pid_other = (pid_hd % 2 == 1) * num_pid_ds + pid_ds
     pid_hd = pid_hd // 2
 
     cb_ptr_og = cb_ptr
@@ -435,7 +437,8 @@ def _chunk_scan_fwd_kernel_new(
     out_x_ptr_og = out_x_ptr
     z_ptr_og = z_ptr
     out_ptr_og = out_ptr
-    for pid_cs in range(num_pid_cs):
+
+    for pid_cs in range(pid_other, num_pid_cs, num_pid_ds*2):
         cb_ptr = cb_ptr_og + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
         x_ptr = x_ptr_og + pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
         dt_ptr = dt_ptr_og + pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head

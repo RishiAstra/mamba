@@ -132,6 +132,8 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 # @triton.jit
 # def _chunk_scan_fwd_kernel(
 
+# TODO: probably should have chunks as outermost pid so that even batch can be done before sync (less total sync)
+
 
 @triton.autotune(
     configs=[
@@ -267,8 +269,91 @@ def _fused3_ssd_kernel(
     c_mask = (offs_hd[:, None] < hdim) & (offs_ds[None, :] < dstate)
     tl.store(states_ptrs_cs, states, mask=c_mask)
 
+
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_HD': 32, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32}, num_stages=5, num_warps=4),
+    ],
+    key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
+)
+@triton.jit
+def _state_passing_fwd_kernel_new(
+    # Pointers to matrices
+    states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
+    # Matrix dimensions
+    batch, nheads, hdim, dstate, nchunks, seqlen, chunk_size,
+    # Strides
+    stride_states_batch, stride_states_chunk, stride_states_head, stride_states_hdim, stride_states_dstate,
+    stride_out_batch, stride_out_chunk, stride_out_head, stride_out_hdim, stride_out_dstate,
+    stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head,
+    stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
+    # Meta-parameters
+    HAS_INITSTATES: tl.constexpr,
+    HAS_SEQ_IDX: tl.constexpr,
+    BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr,
+):
+    # 5 pids, same for all 3 parts
+    # all pids represent domain parallelism except pid_c for state passing
+    pid = tl.program_id(0)
+    num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
+    num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
+    pid_ds = pid % num_pid_ds
+    pid_hd = (pid // num_pid_ds) % num_pid_hd
+    pid_h = (pid // (num_pid_ds * num_pid_hd)) % nheads
+    # TODO: have pid_c
+    # pid_c = (pid // (num_pid_ds * num_pid_hd * nheads)) % nchunks
+    # pid_b = (pid // (num_pid_ds * num_pid_hd * nheads * nchunks)) % batch
+    pid_b = (pid // (num_pid_ds * num_pid_hd * nheads)) % batch
+
+
+    states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
+    dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
+    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+    final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+    if HAS_INITSTATES:
+        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+    if HAS_SEQ_IDX:
+        seq_idx_ptr += pid_b * stride_seq_idx_batch
+
+    offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
+    offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
+    states_ptrs = states_ptr + offs_hd[:, None] * stride_states_hdim + offs_ds[None, :] * stride_states_dstate
+    out_ptrs = out_ptr + offs_hd[:, None] * stride_out_hdim + offs_ds[None, :] * stride_out_dstate
+    final_states_ptrs = final_states_ptr + offs_hd[:, None] * stride_final_states_hdim + offs_ds[None, :] * stride_final_states_dstate
+
+    main_mask = (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
+    if not HAS_INITSTATES:
+        states = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
+    else:
+        initstates_ptrs = initstates_ptr + offs_hd[:, None] * stride_initstates_hdim + offs_ds[None, :] * stride_initstates_dstate
+        states = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+    tl.store(out_ptrs, states, mask=main_mask)
+    out_ptrs += stride_out_chunk
+    seq_idx = 0
+    for c in range(nchunks):
+        new_states = tl.load(states_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+        dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
+        scale = tl.exp(dA_cs)
+        if HAS_SEQ_IDX:
+            seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+            seq_idx = seq_idx_new
+        states = scale * states + new_states
+        if c < nchunks - 1:
+            tl.store(out_ptrs, states, mask=main_mask)
+        else:
+            tl.store(final_states_ptrs, states, mask=main_mask)
+        states_ptrs += stride_states_chunk
+        dA_cs_ptr += stride_dA_cs_chunk
+        out_ptrs += stride_out_chunk
+
+
 def _fused3_ssd(
-    C, B, CB, x, dt, dA_cumsum, C_dtype, D,
+    C, B, CB, x, dt, dA_cumsum, out_dtype, D,
     initial_states=None, seq_idx=None, states_in_fp32=True, z=None
 ):
     # setup from chunk state
@@ -285,15 +370,33 @@ def _fused3_ssd(
     states_dtype = torch.float32 if states_in_fp32 else B.dtype
     states_L = torch.empty((batch, nchunks, nheads, hdim, dstate), device=x.device, dtype=states_dtype)
 
+    # setup from state passing
+    dA_chunk_cumsum = dA_cumsum[:, :, :, -1]
+    assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, hdim, dstate)
+    if seq_idx is not None:
+        assert chunk_size is not None
+        seqlen = seq_idx.shape[-1]
+        assert seq_idx.shape == (batch, seqlen)
+    states_G_dtype = states_L.dtype if out_dtype is None else out_dtype
+    states_G = torch.empty((batch, nchunks, nheads, hdim, dstate), device=states_L.device, dtype=states_G_dtype)
+    final_states = torch.empty((batch, nheads, hdim, dstate), device=states_L.device, dtype=torch.float32)
+    # grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
+
+
+
+
     grid = lambda META: (batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']) * triton.cdiv(dstate, META['BLOCK_SIZE_DS']),)
 
+    sync_atomic = torch.zeros((1,), dtype=torch.int32, device=x.device)
 
     nheads_ngroups_ratio = nheads // ngroups
     BAD_STRIDE=1000000000
     BAD_PTR_FP16 = torch.zeros((1,), dtype=torch.float16, device=x.device)
     BAD_PTR_FP32 = torch.zeros((1,), dtype=torch.float32, device=x.device)
     _fused3_ssd_kernel[grid](
-        None, # grid_atomic,
+        sync_atomic, # grid_atomic,
 
         # Matrix dimensions
         hdim, dstate, chunk_size,
@@ -349,10 +452,21 @@ def _fused3_ssd(
 
 
     # TODO: fuse others:
-    states, final_states = _state_passing_fwd(rearrange(states_L, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
-                                            initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
-                                            seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
-    states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
-    out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    grid2 = lambda META: (batch * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']) * triton.cdiv(dstate, META['BLOCK_SIZE_DS']),)
+    _state_passing_fwd_kernel_new[grid2](
+        states_L, states_G, final_states, dA_chunk_cumsum, initial_states, seq_idx,
+        batch, nheads, hdim, dstate, nchunks, seqlen if seq_idx is not None else 0, chunk_size if seq_idx is not None else 0,
+        states_L.stride(0), states_L.stride(1), states_L.stride(2), states_L.stride(3), states_L.stride(4),
+        states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
+        final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
+        dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
+        *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3)) if initial_states is not None else (0, 0, 0, 0)),
+        *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+        HAS_INITSTATES=initial_states is not None,
+        HAS_SEQ_IDX=seq_idx is not None,
+    )
+
+    # states_G, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states_G, final_states]]
+    out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states_G, D=D, z=z, seq_idx=seq_idx)
     # return torch.zeros_like(x), None, None, None
-    return out, out_x, states, final_states
+    return out, out_x, states_G, final_states

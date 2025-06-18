@@ -60,7 +60,7 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 7)
+    (get_test_size(1024 * 2 ** i),) for i in [6]#range(0, 9, 1)
 ]
 
 configs.append(

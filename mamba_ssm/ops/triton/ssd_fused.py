@@ -137,7 +137,8 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_HD': 32, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=5, num_warps=2),
+        # triton.Config({'BLOCK_SIZE_HD': 32, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=4, num_warps=2),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )

@@ -143,7 +143,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 )
 @triton.jit
 def _fused3_ssd_kernel(
-    grid_atomic,
+    sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
 
     # Matrix dimensions
     hdim, dstate, chunk_size,
@@ -164,13 +164,23 @@ def _fused3_ssd_kernel(
     ########################################
     # Originally State Passing
     ########################################
+
+    # # Pointers to matrices
+    # # Strides
+    # states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
+    # final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
+    # dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
+    # *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3)) if initial_states is not None else (0, 0, 0, 0)),
+
+
+
     # Pointers to matrices
-    states_G_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr,
+    states_G_ptr, final_states_ptr, dA_ccs_ptr, initstates_ptr, # ccs = chunk_cumsum
     # Strides
-    stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_hdim, stride_states_dstate,
-    stride_final_states_batch, stride_final_states_head, stride_final_states_dim,
-    offset_dA_cs_last_elem,
-    stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
+    stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
+    stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
+    stride_dA_ccs_batch, stride_dA_ccs_chunk, stride_dA_ccs_head,
+    stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
 
     ########################################
     # Originally Chunk Scan
@@ -207,6 +217,11 @@ def _fused3_ssd_kernel(
     pid_h = (pid // (num_pid_ds * num_pid_hd)) % nheads
     pid_c = (pid // (num_pid_ds * num_pid_hd * nheads)) % nchunks
     pid_b = (pid // (num_pid_ds * num_pid_hd * nheads * nchunks)) % batch
+
+
+    ########################################
+    # Chunk State
+    ########################################
 
     # chunk state ptrs
     b_ptr_cs = b_ptr + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
@@ -271,6 +286,77 @@ def _fused3_ssd_kernel(
 
 
 
+    ########################################
+    # State Passing
+    ########################################
+
+    sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim + pid_ds * stride_sync_dstate
+
+    states_L_ptr += pid_b * stride_states_L_batch + pid_h * stride_states_L_head
+    dA_ccs_ptr += pid_b * stride_dA_ccs_batch + pid_h * stride_dA_ccs_head
+    states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head
+    final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+    if HAS_INITSTATES:
+        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+    if HAS_SEQ_IDX:
+        seq_idx_ptr += pid_b * stride_seq_idx_batch
+
+    offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
+    offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
+    states_ptrs = states_L_ptr + offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate
+    state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
+    final_states_ptrs = final_states_ptr + offs_hd[:, None] * stride_final_states_hdim + offs_ds[None, :] * stride_final_states_dstate
+
+    main_mask = (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
+    
+    # Instead of looping over chunks, we have pid_c
+    # first sync (wait for previous), then all must load
+
+    # sync
+    # the atomic represents which pid_c is ready
+    # therefore, wait for it to reach our pid_c
+    sync_val = tl.atomic_add(sync_atomic, 0)
+    while sync_val < pid_c:
+        sync_val = tl.atomic_add(sync_atomic, 0)
+
+    # special case 0
+    if pid_c == 0:
+        if not HAS_INITSTATES:
+            states_prev = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
+        else:
+            initstates_ptrs = initstates_ptr + offs_hd[:, None] * stride_initstates_hdim + offs_ds[None, :] * stride_initstates_dstate
+            states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+        tl.store(state_G_ptrs, states_prev, mask=main_mask)
+    else:
+        # need to load states from previous one (but since already offset by 1, just pid_c)
+        states_prev = tl.load(state_G_ptrs + stride_states_G_chunk * pid_c, mask=main_mask, other=0.0).to(tl.float32)
+
+    # ptrs
+    seq_idx = 0
+    states_ptrs += stride_states_L_chunk * pid_c
+    dA_ccs_ptr += stride_dA_ccs_chunk * pid_c
+    state_G_ptrs += stride_states_G_chunk * (pid_c + 1) # offset since 0 gets initial states
+
+    # TODO: load states from last one, must read most recent, so might need to be atomic
+    new_states = tl.load(states_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+
+    dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
+    scale = tl.exp(dA_cs)
+    if HAS_SEQ_IDX:
+        seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+        scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        seq_idx = seq_idx_new
+    states_mod = scale * states_prev + new_states
+    if pid_c < nchunks - 1:
+        tl.store(state_G_ptrs, states_mod, mask=main_mask)
+    else:
+        tl.store(final_states_ptrs, states_mod, mask=main_mask)
+
+    # let the next one go
+    tl.atomic_add(sync_atomic, 1)
+
+
+
 
 @triton.autotune(
     configs=[
@@ -282,14 +368,14 @@ def _fused3_ssd_kernel(
 def _state_passing_fwd_kernel_new(
     sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
     # Pointers to matrices
-    states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
+    states_L_ptr, states_G_ptr, final_states_ptr, dA_ccs_ptr, initstates_ptr, seq_idx_ptr,
     # Matrix dimensions
     batch, nheads, hdim, dstate, nchunks, seqlen, chunk_size,
     # Strides
-    stride_states_batch, stride_states_chunk, stride_states_head, stride_states_hdim, stride_states_dstate,
-    stride_out_batch, stride_out_chunk, stride_out_head, stride_out_hdim, stride_out_dstate,
+    stride_states_L_batch, stride_states_L_chunk, stride_states_L_head, stride_states_L_hdim, stride_states_L_dstate,
+    stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
     stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
-    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head,
+    stride_dA_ccs_batch, stride_dA_ccs_chunk, stride_dA_ccs_head,
     stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
     # Meta-parameters
@@ -310,9 +396,9 @@ def _state_passing_fwd_kernel_new(
 
     sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim + pid_ds * stride_sync_dstate
 
-    states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
-    dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
-    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+    states_L_ptr += pid_b * stride_states_L_batch + pid_h * stride_states_L_head
+    dA_ccs_ptr += pid_b * stride_dA_ccs_batch + pid_h * stride_dA_ccs_head
+    states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head
     final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
     if HAS_INITSTATES:
         initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
@@ -321,8 +407,8 @@ def _state_passing_fwd_kernel_new(
 
     offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
     offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
-    states_ptrs = states_ptr + offs_hd[:, None] * stride_states_hdim + offs_ds[None, :] * stride_states_dstate
-    out_ptrs = out_ptr + offs_hd[:, None] * stride_out_hdim + offs_ds[None, :] * stride_out_dstate
+    states_ptrs = states_L_ptr + offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate
+    state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
     final_states_ptrs = final_states_ptr + offs_hd[:, None] * stride_final_states_hdim + offs_ds[None, :] * stride_final_states_dstate
 
     main_mask = (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
@@ -340,35 +426,35 @@ def _state_passing_fwd_kernel_new(
     # special case 0
     if pid_c == 0:
         if not HAS_INITSTATES:
-            states = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
+            states_prev = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
         else:
             initstates_ptrs = initstates_ptr + offs_hd[:, None] * stride_initstates_hdim + offs_ds[None, :] * stride_initstates_dstate
-            states = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
-        tl.store(out_ptrs, states, mask=main_mask)
+            states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+        tl.store(state_G_ptrs, states_prev, mask=main_mask)
     else:
         # need to load states from previous one (but since already offset by 1, just pid_c)
-        states = tl.load(out_ptrs + stride_out_chunk * pid_c, mask=main_mask, other=0.0).to(tl.float32)
+        states_prev = tl.load(state_G_ptrs + stride_states_G_chunk * pid_c, mask=main_mask, other=0.0).to(tl.float32)
 
     # ptrs
     seq_idx = 0
-    states_ptrs += stride_states_chunk * pid_c
-    dA_cs_ptr += stride_dA_cs_chunk * pid_c
-    out_ptrs += stride_out_chunk * (pid_c + 1) # offset since 0 gets initial states
+    states_ptrs += stride_states_L_chunk * pid_c
+    dA_ccs_ptr += stride_dA_ccs_chunk * pid_c
+    state_G_ptrs += stride_states_G_chunk * (pid_c + 1) # offset since 0 gets initial states
 
     # TODO: load states from last one, must read most recent, so might need to be atomic
     new_states = tl.load(states_ptrs, mask=main_mask, other=0.0).to(tl.float32)
 
-    dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
+    dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
     scale = tl.exp(dA_cs)
     if HAS_SEQ_IDX:
         seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
         scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
         seq_idx = seq_idx_new
-    states = scale * states + new_states
+    states_mod = scale * states_prev + new_states
     if pid_c < nchunks - 1:
-        tl.store(out_ptrs, states, mask=main_mask)
+        tl.store(state_G_ptrs, states_mod, mask=main_mask)
     else:
-        tl.store(final_states_ptrs, states, mask=main_mask)
+        tl.store(final_states_ptrs, states_mod, mask=main_mask)
 
     # let the next one go
     tl.atomic_add(sync_atomic, 1)
@@ -417,7 +503,7 @@ def _fused3_ssd(
     BAD_PTR_FP16 = torch.zeros((1,), dtype=torch.float16, device=x.device)
     BAD_PTR_FP32 = torch.zeros((1,), dtype=torch.float32, device=x.device)
     _fused3_ssd_kernel[grid](
-        sync_atomic, # grid_atomic,
+        sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
 
         # Matrix dimensions
         hdim, dstate, chunk_size,
@@ -439,12 +525,12 @@ def _fused3_ssd(
         # Originally State Passing
         ########################################
         # Pointers to matrices
-        BAD_PTR_FP32, BAD_PTR_FP32, BAD_PTR_FP32, BAD_PTR_FP32, # states_G_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr,
+        states_G, final_states, dA_chunk_cumsum, initial_states,
         # Strides
-        BAD_STRIDE, BAD_STRIDE, BAD_STRIDE, BAD_STRIDE, BAD_STRIDE, # stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_hdim, stride_states_dstate,
-        BAD_STRIDE, BAD_STRIDE, BAD_STRIDE, # stride_final_states_batch, stride_final_states_head, stride_final_states_dim,
-        BAD_STRIDE, # offset_dA_cs_last_elem,
-        BAD_STRIDE, BAD_STRIDE, BAD_STRIDE, # stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
+        states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
+        final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
+        dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
+        *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3)) if initial_states is not None else (0, 0, 0, 0)),
 
         ########################################
         # Originally Chunk Scan
@@ -473,19 +559,19 @@ def _fused3_ssd(
 
 
     # TODO: fuse others:
-    _state_passing_fwd_kernel_new[grid](
-        sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
-        states_L, states_G, final_states, dA_chunk_cumsum, initial_states, seq_idx,
-        batch, nheads, hdim, dstate, nchunks, seqlen if seq_idx is not None else 0, chunk_size if seq_idx is not None else 0,
-        states_L.stride(0), states_L.stride(1), states_L.stride(2), states_L.stride(3), states_L.stride(4),
-        states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
-        final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
-        dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
-        *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3)) if initial_states is not None else (0, 0, 0, 0)),
-        *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
-        HAS_INITSTATES=initial_states is not None,
-        HAS_SEQ_IDX=seq_idx is not None,
-    )
+    # _state_passing_fwd_kernel_new[grid](
+    #     sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
+    #     states_L, states_G, final_states, dA_chunk_cumsum, initial_states, seq_idx,
+    #     batch, nheads, hdim, dstate, nchunks, seqlen if seq_idx is not None else 0, chunk_size if seq_idx is not None else 0,
+    #     states_L.stride(0), states_L.stride(1), states_L.stride(2), states_L.stride(3), states_L.stride(4),
+    #     states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
+    #     final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
+    #     dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
+    #     *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3)) if initial_states is not None else (0, 0, 0, 0)),
+    #     *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+    #     HAS_INITSTATES=initial_states is not None,
+    #     HAS_SEQ_IDX=seq_idx is not None,
+    # )
 
     # states_G, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states_G, final_states]]
     out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states_G, D=D, z=z, seq_idx=seq_idx)

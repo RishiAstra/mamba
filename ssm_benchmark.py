@@ -12,7 +12,7 @@ import numpy as np
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias)
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, method=None)
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
@@ -28,7 +28,7 @@ def run_fullyfused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
-    (run_fused_ssd, "Fused", "red"),
+    # (run_fused_ssd, "Fused", "red"),
     (run_fullyfused_ssd, "Fully Fused", "green"),
 ]
 
@@ -60,8 +60,8 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1)
-    # (get_test_size(1024 * 2 ** i),) for i in [6] # for quick test
+    # (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1)
+    (get_test_size(1024 * 2 ** i),) for i in [6] # for quick test
 ]
 
 configs.append(

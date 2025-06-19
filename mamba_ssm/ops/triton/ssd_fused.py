@@ -138,8 +138,15 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 @triton.autotune(
     configs=[
         # triton.Config({'BLOCK_SIZE_HD': 32, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=5, num_warps=2),
+        # good 2 warp config:
         # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=2),
-        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=2),
+        # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=4, maxnreg=128),
+        # good 4 warp config (worse than 2 warp):
+        # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=8, maxnreg=128),
+        # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=16, maxnreg=64),
+        # best config so far:
+        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=1, num_warps=4, maxnreg=128),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
@@ -429,7 +436,7 @@ def _fused3_ssd_kernel(
             dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
             K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * BLOCK_SIZE_CS, chunk_size_limit)
             for k in range(0, K_MAX, CS_BLOCK_SIZE_DS):
-                cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0).to(tl.float32)
+                cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last').to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
                 # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
                 # So we don't need masking wrt seq_idx here.
@@ -440,7 +447,7 @@ def _fused3_ssd_kernel(
                     mask = offs_cs[:, None] >= k + offs_k[None, :]
                     cb = tl.where(mask, cb, 0.0)
                 cb = cb.to(x_ptr.dtype.element_ty)
-                x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0)
+                x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
                 acc += tl.dot(cb, x)
                 cb_ptrs += CS_BLOCK_SIZE_DS * stride_cb_csize_k
                 x_ptrs += CS_BLOCK_SIZE_DS * stride_x_seqlen

@@ -146,7 +146,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
         # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=8, maxnreg=128),
         # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=16, maxnreg=64),
         # best config so far:
-        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=1, num_warps=4, maxnreg=128),
+        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'SP_BLOCK_SIZE_HD': 64, 'SP_BLOCK_SIZE_DS': 32, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=1, num_warps=4, maxnreg=128),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
@@ -204,7 +204,8 @@ def _fused3_ssd_kernel(
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
     # Block sizes
-    BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr,
+    BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, CS_BLOCK_SIZE_CS: tl.constexpr,
+    SP_BLOCK_SIZE_HD: tl.constexpr, SP_BLOCK_SIZE_DS: tl.constexpr, 
     CS_BLOCK_SIZE_HD: tl.constexpr, CS_BLOCK_SIZE_DS: tl.constexpr,
     # NOTE: not an autotune thing
     BLOCK_SIZE_DSTATE: tl.constexpr,
@@ -231,8 +232,8 @@ def _fused3_ssd_kernel(
     if HAS_SEQ_IDX:
         seq_idx_ptr_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
-    for pid_hd in range(0, num_pid_hd, 1):
-        for pid_ds in range(0, num_pid_ds, 1):
+    for pid_ds in range(0, num_pid_ds, 1):
+        for pid_hd in range(0, num_pid_hd, 1):
             # chunk state offsets
             # NOTE: m ->hdim, n -> dstate, k -> chunk_size
             offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
@@ -314,11 +315,13 @@ def _fused3_ssd_kernel(
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
-    for pid_hd in range(0, num_pid_hd, 1):
-        for pid_ds in range(0, num_pid_ds, 1):
+    sp_num_pid_ds = tl.cdiv(dstate, SP_BLOCK_SIZE_DS)
+    sp_num_pid_hd = tl.cdiv(hdim, SP_BLOCK_SIZE_HD)
+    for pid_ds in range(0, sp_num_pid_ds, 1):
+        for pid_hd in range(0, sp_num_pid_hd, 1):
             dA_ccs_ptr_iter = dA_ccs_ptr
-            offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
-            offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
+            offs_hd = pid_hd * SP_BLOCK_SIZE_HD + tl.arange(0, SP_BLOCK_SIZE_HD)
+            offs_ds = pid_ds * SP_BLOCK_SIZE_DS + tl.arange(0, SP_BLOCK_SIZE_DS)
             states_ptrs = states_L_ptr + offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate
             state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
             final_states_ptrs = final_states_ptr + offs_hd[:, None] * stride_final_states_hdim + offs_ds[None, :] * stride_final_states_dstate
@@ -328,7 +331,7 @@ def _fused3_ssd_kernel(
             # special case 0
             if pid_c == 0:
                 if not HAS_INITSTATES:
-                    states_prev = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
+                    states_prev = tl.zeros((SP_BLOCK_SIZE_HD, SP_BLOCK_SIZE_DS), dtype=tl.float32)
                 else:
                     initstates_ptrs = initstates_ptr + offs_hd[:, None] * stride_initstates_hdim + offs_ds[None, :] * stride_initstates_dstate
                     states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
@@ -368,7 +371,7 @@ def _fused3_ssd_kernel(
     # pids same for all 3 parts
     # all pids represent domain parallelism except pid_c for state passing
     cs_num_pid_hd = tl.cdiv(hdim, CS_BLOCK_SIZE_HD)
-    cs_num_pid_cs = tl.cdiv(chunk_size, BLOCK_SIZE_CS)
+    cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS)
 
     cb_ptr_og = cb_ptr
     x_ptr_og = x_ptr
@@ -391,7 +394,7 @@ def _fused3_ssd_kernel(
             if HAS_SEQ_IDX:
                 seq_idx_ptr = seq_idx_ptr_og + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
-            offs_cs = pid_cs * BLOCK_SIZE_CS + tl.arange(0, BLOCK_SIZE_CS)
+            offs_cs = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
             offs_hd = pid_hd * CS_BLOCK_SIZE_HD + tl.arange(0, CS_BLOCK_SIZE_HD)
             dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize, mask=offs_cs < chunk_size, other=0.0).to(tl.float32)
 
@@ -399,7 +402,7 @@ def _fused3_ssd_kernel(
             if HAS_SEQ_IDX:
                 seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
                 seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
-            acc = tl.zeros((BLOCK_SIZE_CS, CS_BLOCK_SIZE_HD), dtype=tl.float32)
+            acc = tl.zeros((CS_BLOCK_SIZE_CS, CS_BLOCK_SIZE_HD), dtype=tl.float32)
 
             # Without the if (pid_c > -1), with Triton 2.1.0, I get
             # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
@@ -434,7 +437,7 @@ def _fused3_ssd_kernel(
             x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim)
             dt_ptrs = dt_ptr + offs_k * stride_dt_csize
             dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
-            K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * BLOCK_SIZE_CS, chunk_size_limit)
+            K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS, chunk_size_limit)
             for k in range(0, K_MAX, CS_BLOCK_SIZE_DS):
                 cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last').to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
@@ -454,7 +457,7 @@ def _fused3_ssd_kernel(
                 dt_ptrs += CS_BLOCK_SIZE_DS * stride_dt_csize
                 dA_cumsum_ptrs += CS_BLOCK_SIZE_DS * stride_dA_cs_csize
 
-            offs_out_m = pid_cs * BLOCK_SIZE_CS + tl.arange(0, BLOCK_SIZE_CS)
+            offs_out_m = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
             offs_out_n = pid_hd * CS_BLOCK_SIZE_HD + tl.arange(0, CS_BLOCK_SIZE_HD)
 
             if HAS_D:

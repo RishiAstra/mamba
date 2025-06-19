@@ -60,8 +60,8 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    # (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1)
-    (get_test_size(1024 * 2 ** i),) for i in [6] # for quick test
+    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1)
+    # (get_test_size(1024 * 2 ** i),) for i in [6] # for quick test
 ]
 
 configs.append(
@@ -83,12 +83,12 @@ def get_rand_input(dims):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims
     torch.manual_seed(0)
 
-    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.01 + 0.05
+    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.005 + 0.025
     dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE) * 0.01
-    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.01 + 0.03
+    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.005 + 0.02
     B = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 0.1 + 0.3
     C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 0.1 + 0.3
-    D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.01 + 0.95
+    D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.01 + 0.3
     x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 0.4
 
     return dt, dt_bias, A, B, C, D, x
@@ -137,6 +137,7 @@ def benchmark(dims, provider):
 if __name__ == "__main__":
     # use to check correctness
     # run_unit_test(1024)
+    # run_unit_test(4096)
     # use to benchmark
     benchmark.run(show_plots=True, print_data=True)
 

@@ -138,7 +138,8 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 @triton.autotune(
     configs=[
         # triton.Config({'BLOCK_SIZE_HD': 32, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=4, num_warps=2),
+        # triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=2),
+        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 32, 'CS_BLOCK_SIZE_HD': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=3, num_warps=2),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
@@ -248,7 +249,7 @@ def _fused3_ssd_kernel(
             # chunk state chunk_size loop
             acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
             for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
-                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0)
+                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
                 b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0).to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
                 if HAS_SEQ_IDX:
@@ -335,7 +336,7 @@ def _fused3_ssd_kernel(
             dA_ccs_ptr_iter += stride_dA_ccs_chunk * pid_c
             state_G_ptrs += stride_states_G_chunk * (pid_c + 1) # offset since 0 gets initial states
 
-            new_states = tl.load(states_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+            new_states = tl.load(states_ptrs, mask=main_mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
 
             dA_cs = tl.load(dA_ccs_ptr_iter).to(tl.float32)
             scale = tl.exp(dA_cs)
@@ -470,7 +471,7 @@ def _fused3_ssd_kernel(
 
             out_ptr = out_ptr_og + pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
             out_ptrs = out_ptr + (stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim)
-            tl.store(out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim))
+            tl.store(out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim), eviction_policy='evict_first')
 
 
 def _fused3_ssd(

@@ -257,7 +257,7 @@ def _fused3_ssd_kernel(
             acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
             for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
                 x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
-                b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0).to(tl.float32)
+                b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first').to(tl.float32)
                 dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
                 if HAS_SEQ_IDX:
                     seq_idx_k = tl.load(seq_idx_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=-1)
@@ -284,7 +284,7 @@ def _fused3_ssd_kernel(
             offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
             states_ptrs_cs = states_L_ptr_cs + (offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate)
             c_mask = (offs_hd[:, None] < hdim) & (offs_ds[None, :] < dstate)
-            tl.store(states_ptrs_cs, states, mask=c_mask)
+            tl.store(states_ptrs_cs, states, mask=c_mask, eviction_policy='evict_last')
 
 
 

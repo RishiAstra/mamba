@@ -219,16 +219,24 @@ def _fused3_ssd_kernel(
     pid_c = (pid // (nheads)) % nchunks
     pid_b = (pid // (nheads * nchunks)) % batch
 
+    # advance ptrs up front to simplify and slightly reduce register pressure
+    # does actually provide a small benefit vs the original separate ptrs per step
+    states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head + pid_c * stride_states_G_chunk
+    x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
+    b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
+    dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
+    dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+    states_L_ptr += pid_b * stride_states_L_batch + pid_c * stride_states_L_chunk + pid_h * stride_states_L_head
+    dA_ccs_ptr += pid_b * stride_dA_ccs_batch + pid_h * stride_dA_ccs_head + stride_dA_ccs_chunk * pid_c
+    cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
+    C_ptr += pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
+    out_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
 
     ########################################
     # Chunk State
     ########################################
 
     # chunk state ptrs
-    b_ptr_cs = b_ptr + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
-    x_ptr_cs = x_ptr + pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
-    dt_ptr_cs = dt_ptr + pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
-    dA_cumsum_ptr_cs = dA_cumsum_ptr + pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
     if HAS_SEQ_IDX:
         seq_idx_ptr_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
@@ -241,11 +249,11 @@ def _fused3_ssd_kernel(
             offs_cs = tl.arange(0, BLOCK_SIZE_CS)
 
             # chunk state ptr blocks
-            x_ptrs_cs = x_ptr_cs + (offs_hd[:, None] * stride_x_hdim + offs_cs[None, :] * stride_x_seqlen)
-            b_ptrs_cs = b_ptr_cs + (offs_ds[None, :] * stride_b_dstate + offs_cs[:, None] * stride_b_seqlen)
-            dt_ptrs_cs = dt_ptr_cs + offs_cs * stride_dt_csize
-            dA_cs_last = tl.load(dA_cumsum_ptr_cs + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
-            dA_cumsum_ptrs_cs = dA_cumsum_ptr_cs + offs_cs * stride_dA_cs_csize
+            x_ptrs_cs = x_ptr + (offs_hd[:, None] * stride_x_hdim + offs_cs[None, :] * stride_x_seqlen)
+            b_ptrs_cs = b_ptr + (offs_ds[None, :] * stride_b_dstate + offs_cs[:, None] * stride_b_seqlen)
+            dt_ptrs_cs = dt_ptr + offs_cs * stride_dt_csize
+            dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
+            dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
             if HAS_SEQ_IDX:
                 seq_idx_ptrs_cs = seq_idx_ptr_cs + offs_cs * stride_seq_idx_seqlen
 
@@ -268,7 +276,7 @@ def _fused3_ssd_kernel(
                 else:
                     scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
                 b *= scale[:, None]
-                b = b.to(x_ptr_cs.dtype.element_ty)
+                b = b.to(x_ptr.dtype.element_ty)
                 acc += tl.dot(x, b)
                 x_ptrs_cs += BLOCK_SIZE_CS * stride_x_seqlen
                 b_ptrs_cs += BLOCK_SIZE_CS * stride_b_seqlen
@@ -279,11 +287,7 @@ def _fused3_ssd_kernel(
             states = acc.to(states_L_ptr.dtype.element_ty)
 
             # chunk state final store
-            states_L_ptr_cs = states_L_ptr + pid_b * stride_states_L_batch + pid_c * stride_states_L_chunk + pid_h * stride_states_L_head
-            # TODO: seems like a duplicate `offs` computation, but maybe it reduces register pressure
-            offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
-            offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
-            states_ptrs_cs = states_L_ptr_cs + (offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate)
+            states_ptrs_cs = states_L_ptr + (offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate)
             c_mask = (offs_hd[:, None] < hdim) & (offs_ds[None, :] < dstate)
             tl.store(states_ptrs_cs, states, mask=c_mask, eviction_policy='evict_last')
 
@@ -305,10 +309,6 @@ def _fused3_ssd_kernel(
     while sync_val < pid_c:
         sync_val = tl.atomic_add(sync_atomic, 0)
 
-    states_L_ptr += pid_b * stride_states_L_batch + pid_h * stride_states_L_head
-    dA_ccs_ptr += pid_b * stride_dA_ccs_batch + pid_h * stride_dA_ccs_head
-    prev_states_ptr_og = states_G_ptr # preserve for chunk scan
-    states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head
     final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
     if HAS_INITSTATES:
         initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
@@ -319,7 +319,6 @@ def _fused3_ssd_kernel(
     sp_num_pid_hd = tl.cdiv(hdim, SP_BLOCK_SIZE_HD)
     for pid_ds in range(0, sp_num_pid_ds, 1):
         for pid_hd in range(0, sp_num_pid_hd, 1):
-            dA_ccs_ptr_iter = dA_ccs_ptr
             offs_hd = pid_hd * SP_BLOCK_SIZE_HD + tl.arange(0, SP_BLOCK_SIZE_HD)
             offs_ds = pid_ds * SP_BLOCK_SIZE_DS + tl.arange(0, SP_BLOCK_SIZE_DS)
             states_ptrs = states_L_ptr + offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate
@@ -338,17 +337,15 @@ def _fused3_ssd_kernel(
                 tl.store(state_G_ptrs, states_prev, mask=main_mask)
             else:
                 # need to load states from previous one (but since already offset by 1, just pid_c)
-                states_prev = tl.load(state_G_ptrs + stride_states_G_chunk * pid_c, mask=main_mask, other=0.0).to(tl.float32)
+                states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0).to(tl.float32)
 
             # ptrs
             seq_idx = 0
-            states_ptrs += stride_states_L_chunk * pid_c
-            dA_ccs_ptr_iter += stride_dA_ccs_chunk * pid_c
-            state_G_ptrs += stride_states_G_chunk * (pid_c + 1) # offset since 0 gets initial states
+            state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
 
             new_states = tl.load(states_ptrs, mask=main_mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
 
-            dA_cs = tl.load(dA_ccs_ptr_iter).to(tl.float32)
+            dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
             scale = tl.exp(dA_cs)
             if HAS_SEQ_IDX:
                 seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
@@ -373,24 +370,12 @@ def _fused3_ssd_kernel(
     cs_num_pid_hd = tl.cdiv(hdim, CS_BLOCK_SIZE_HD)
     cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS)
 
-    cb_ptr_og = cb_ptr
-    x_ptr_og = x_ptr
-    dt_ptr_og = dt_ptr
-    dA_cumsum_ptr_og = dA_cumsum_ptr
-    C_ptr_og = C_ptr
     seq_idx_ptr_og = seq_idx_ptr
     out_x_ptr_og = out_x_ptr
     z_ptr_og = z_ptr
-    out_ptr_og = out_ptr
 
     for pid_hd in range(0, cs_num_pid_hd, 1):
         for pid_cs in range(0, cs_num_pid_cs, 1): # pid_other, num_pid_cs, num_pid_ds*CS_BLOCK_HD_MULT):
-            cb_ptr = cb_ptr_og + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
-            x_ptr = x_ptr_og + pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
-            dt_ptr = dt_ptr_og + pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
-            dA_cumsum_ptr = dA_cumsum_ptr_og + pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
-            C_ptr = C_ptr_og + pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
-            states_G_ptr = prev_states_ptr_og + pid_b * stride_states_G_batch + pid_c * stride_states_G_chunk + pid_h * stride_states_G_head
             if HAS_SEQ_IDX:
                 seq_idx_ptr = seq_idx_ptr_og + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
@@ -479,7 +464,6 @@ def _fused3_ssd_kernel(
                 z = tl.load(z_ptrs, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim), other=0.0).to(tl.float32)
                 acc *= z * tl.sigmoid(z)
 
-            out_ptr = out_ptr_og + pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
             out_ptrs = out_ptr + (stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim)
             tl.store(out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim), eviction_policy='evict_first')
 

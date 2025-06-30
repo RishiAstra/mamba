@@ -152,6 +152,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 )
 @triton.jit
 def _fused3_ssd_kernel(
+    grid_atomic, USE_ATOMIC_PID: tl.constexpr,
     sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
 
     # Matrix dimensions
@@ -212,7 +213,11 @@ def _fused3_ssd_kernel(
 ):
     # pids same for all 3 parts
     # all pids represent domain parallelism except pid_c for state passing
-    pid = tl.program_id(0)
+    if USE_ATOMIC_PID:
+        pid = tl.atomic_add(grid_atomic, 1)
+    else:
+        pid = tl.program_id(0)
+
     num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
     num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     pid_h = pid % nheads
@@ -468,7 +473,7 @@ def _fused3_ssd_kernel(
 
 def _fused3_ssd(
     C, B, CB, x, dt, dA_cumsum, out_dtype, D,
-    initial_states=None, seq_idx=None, states_in_fp32=True, z=None
+    initial_states=None, seq_idx=None, states_in_fp32=True, z=None, use_atomic_pid=True # if True, don't count on 1d grid launching in order
 ):
     # setup from chunk state
     batch, seqlen, nheads, hdim = x.shape
@@ -516,11 +521,15 @@ def _fused3_ssd(
 
     grid = lambda META: (batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']),)
 
-    sync_atomic = torch.zeros((batch, nheads, hdim, dstate), dtype=torch.int32, device=x.device)
+    # 32 is for cache lines, dstate is not used here
+    sync_atomic = torch.zeros((batch * nheads * hdim * 32 + 32,), dtype=torch.int32, device=x.device)
 
     nheads_ngroups_ratio = nheads // ngroups
     _fused3_ssd_kernel[grid](
-        sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
+        # grid_atomic, use_atomic_pid
+        # sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
+        sync_atomic[batch * nheads * hdim * 32 : batch * nheads * hdim * 32 + 1], use_atomic_pid,
+        sync_atomic, nheads * hdim * 32, hdim * 32, 32, 1,
 
         # Matrix dimensions
         hdim, dstate, chunk_size,

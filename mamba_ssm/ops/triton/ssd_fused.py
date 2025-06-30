@@ -150,6 +150,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
+# NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
 def _fused3_ssd_kernel(
     grid_atomic, USE_ATOMIC_PID: tl.constexpr,

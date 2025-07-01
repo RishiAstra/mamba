@@ -28,7 +28,7 @@ def run_fullyfused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
-    # (run_fused_ssd, "Fused", "red"),
+    (run_fused_ssd, "Fused", "red"),
     (run_fullyfused_ssd, "Fully Fused", "green"),
 ]
 

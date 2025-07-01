@@ -588,19 +588,26 @@ def _fused3_ssd(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'SP_BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 32}, num_stages=1, num_warps=4, maxnreg=128),
+        triton.Config({
+            'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64,
+            'SP_BLOCK_SIZE_DS': 64,
+            'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 32,
+            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 2,
+            }, num_stages=1, num_warps=4, maxnreg=128),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
 # NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
 def _fused5_ssd_kernel(
+    bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
+    grid_atomic_bmm,
     grid_atomic, USE_ATOMIC_PID: tl.constexpr,
     sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
 
     # Matrix dimensions
     hdim, dstate, chunk_size,
-    batch, seqlen, nheads_ngroups_ratio, nheads, nchunks,
+    batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
     ########################################
     # Originally Chunk State
     ########################################
@@ -651,22 +658,89 @@ def _fused5_ssd_kernel(
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, CS_BLOCK_SIZE_CS: tl.constexpr,
     SP_BLOCK_SIZE_DS: tl.constexpr, 
     CS_BLOCK_SIZE_DS: tl.constexpr,
+    BMM_BLOCK_SIZE_M: tl.constexpr,
+    BMM_BLOCK_SIZE_N: tl.constexpr,
+    BMM_BLOCK_SIZE_K: tl.constexpr,
+    BMM_STAGES: tl.constexpr,
     # NOTE: not an autotune thing
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
-    # pids same for all 3 parts
-    # all pids represent domain parallelism except pid_c for state passing
+
+    ########################################
+    # BMM (CB)
+    ########################################
+
+    pid1 = tl.atomic_add(grid_atomic_bmm, 1)
+
+    num_pid_n = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_M)
+    while pid1 < num_pid_n * num_pid_m * batch * nchunks * ngroups:
+        pid_n = pid1 % num_pid_n
+        pid_m = (pid1 // num_pid_n) % num_pid_m
+        pid_b = (pid1 // (num_pid_n * num_pid_m)) % batch
+        pid_c = (pid1 // (num_pid_n * num_pid_m * batch)) % nchunks
+        pid_h = (pid1 // (num_pid_n * num_pid_m * batch * nchunks)) % ngroups
+        if not IS_CAUSAL or pid_n * BMM_BLOCK_SIZE_N < (pid_m + 1) * BMM_BLOCK_SIZE_M:
+            a_ptr = C_ptr + pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + pid_h * stride_C_head
+            b_ptr_bmm = b_ptr + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + pid_h * stride_b_head
+            if HAS_SEQ_IDX:
+                seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+
+            offs_m = pid_m * BMM_BLOCK_SIZE_M + tl.arange(0, BMM_BLOCK_SIZE_M)
+            offs_n = pid_n * BMM_BLOCK_SIZE_N + tl.arange(0, BMM_BLOCK_SIZE_N)
+            offs_k = tl.arange(0, BMM_BLOCK_SIZE_K)
+            a_ptrs = a_ptr + (offs_m[:, None] * stride_C_seqlen + offs_k[None, :] * stride_C_dstate)
+            b_ptrs = b_ptr_bmm + (offs_k[:, None] * stride_b_dstate + offs_n[None, :] * stride_b_seqlen)
+            chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+
+            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float32)
+            # for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
+            for k in tl.range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K), num_stages=BMM_STAGES):
+                a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0).to(C_ptr.dtype.element_ty)
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0).to(C_ptr.dtype.element_ty)
+                acc += tl.dot(a, b)
+                a_ptrs += BMM_BLOCK_SIZE_K * stride_C_dstate
+                b_ptrs += BMM_BLOCK_SIZE_K * stride_b_dstate
+
+            offs_m = pid_m * BMM_BLOCK_SIZE_M + tl.arange(0, BMM_BLOCK_SIZE_M)
+            offs_n = pid_n * BMM_BLOCK_SIZE_N + tl.arange(0, BMM_BLOCK_SIZE_N)
+            if HAS_SEQ_IDX:
+                chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+                seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
+                seq_idx_n = tl.load(seq_idx_ptr + offs_n * stride_seq_idx_seqlen, mask=offs_n < chunk_size_limit, other=-2)
+                acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
+            out = acc.to(out_ptr.dtype.element_ty)
+
+            out_ptr_cb = cb_ptr + pid_b * stride_out_batch + pid_c * stride_cb_chunk + pid_h * stride_out_head
+            out_ptrs_cb = out_ptr_cb + (stride_cb_csize_m * offs_m[:, None] + offs_n[None, :] * stride_cb_csize_k)
+            tl.store(out_ptrs_cb, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+        # mark progress
+        tl.atomic_add(bmm_wait_ptr + pid_b * bmm_wait_stride_batch + pid_c * bmm_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
+        pid1 = tl.atomic_add(grid_atomic_bmm, 1)
+
+
     if USE_ATOMIC_PID:
         pid = tl.atomic_add(grid_atomic, 1)
     else:
         pid = tl.program_id(0)
 
+
+    # pids same for all 3 parts
+    # all pids represent domain parallelism except pid_c for state passing
     num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
     num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     pid_h = pid % nheads
     pid_c = (pid // (nheads)) % nchunks
     pid_b = (pid // (nheads * nchunks)) % batch
     pid_hd = (pid // (nheads * nchunks * batch)) % num_pid_hd
+
+
+    # wait for this (batch, chunk)
+    bmm_wait_ptr += pid_b * bmm_wait_stride_batch + pid_c * bmm_wait_stride_chunk
+    bmm_wait_val = tl.atomic_add(bmm_wait_ptr, 0, sem='acquire')
+    while bmm_wait_val < chunk_size * chunk_size * ngroups: # TODO: does not consider of block sizes do not divide chunk size
+        bmm_wait_val = tl.atomic_add(bmm_wait_ptr, 0, sem='acquire')
+
 
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
@@ -965,18 +1039,24 @@ def _fused5_ssd(
     grid = lambda META: (batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']),)
 
     # 32 is for cache lines, dstate is not used here
-    sync_atomic = torch.zeros((batch * nheads * hdim * 32 + 32,), dtype=torch.int32, device=x.device)
+    states_ready_size = batch * nheads * hdim * 32
+    grid_atomic_size = 2 * 32
+    bmm_ready_size = batch * nchunks * 32
+    sync_atomic = torch.zeros((states_ready_size + grid_atomic_size + bmm_ready_size,), dtype=torch.int32, device=x.device)
 
     nheads_ngroups_ratio = nheads // ngroups
     _fused5_ssd_kernel[grid](
+        sync_atomic[states_ready_size + grid_atomic_size: states_ready_size + grid_atomic_size+1],
+        nchunks * 32, 32,
         # grid_atomic, use_atomic_pid
         # sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
-        sync_atomic[batch * nheads * hdim * 32 : batch * nheads * hdim * 32 + 1], use_atomic_pid,
+        sync_atomic[states_ready_size + 32: states_ready_size + 33],
+        sync_atomic[states_ready_size : states_ready_size + 1], use_atomic_pid,
         sync_atomic, nheads * hdim * 32, hdim * 32, 32, 1,
 
         # Matrix dimensions
         hdim, dstate, chunk_size,
-        batch, seqlen, nheads_ngroups_ratio, nheads, nchunks,
+        batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
         ########################################
         # Originally Chunk State
         ########################################

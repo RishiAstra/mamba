@@ -338,7 +338,8 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         )
     elif method == 'fullyfused':
         # all 3 big kernels fused
-        CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+        nchunks = math.ceil(seqlen / chunk_size)
+        CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32)
         dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
         out, out_x, states, final_states = _fused5_ssd(
             C, B, CB, x, dt, dA_cumsum, C.dtype, D, 

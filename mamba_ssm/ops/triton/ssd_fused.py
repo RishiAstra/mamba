@@ -602,9 +602,7 @@ def _fused3_ssd(
 @triton.jit
 def _fused5_ssd_kernel(
     ccs_wait_ptr, ccs_wait_stride_batch, ccs_wait_stride_chunk,
-    grid_atomic_ccs,
     bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
-    grid_atomic_bmm,
     grid_atomic, USE_ATOMIC_PID: tl.constexpr,
     sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
 
@@ -684,18 +682,25 @@ def _fused5_ssd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
-    
+    if USE_ATOMIC_PID:
+        pid_og = tl.atomic_add(grid_atomic, 1)
+    else:
+        pid_og = tl.program_id(0)
 
-    ########################################
-    # Chunk Cumsum
-    ########################################
-
-    pid2 = tl.atomic_add(grid_atomic_ccs, 1)
     ccs_num_pid_h = tl.cdiv(nheads, CCS_BLOCK_SIZE_H)
-    while pid2 < batch * nchunks * ccs_num_pid_h:
-        pid_b = pid2 % batch
-        pid_c = (pid2 // batch) % nchunks
-        pid_h = (pid2 // (batch * nchunks)) % ccs_num_pid_h
+    num_pids_css = batch * nchunks * ccs_num_pid_h
+    num_pid_n = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_M)
+    num_pids_bmm = num_pid_n * num_pid_m * batch * nchunks * ngroups
+
+    if pid_og < num_pids_css:
+        ########################################
+        # Chunk Cumsum
+        ########################################
+        pid_ccs = pid_og
+        pid_b = pid_ccs % batch
+        pid_c = (pid_ccs // batch) % nchunks
+        pid_h = (pid_ccs // (batch * nchunks)) % ccs_num_pid_h
 
 
         css_dt_ptr = dt_orig_ptr + pid_b * stride_dt_orig_batch + pid_c * chunk_size * stride_dt_orig_seqlen
@@ -729,22 +734,17 @@ def _fused5_ssd_kernel(
 
         # mark progress
         tl.atomic_add(ccs_wait_ptr + pid_b * ccs_wait_stride_batch + pid_c * ccs_wait_stride_chunk, CCS_BLOCK_SIZE_H, sem='release')
-        pid2 = tl.atomic_add(grid_atomic_ccs, 1)
 
-    ########################################
-    # BMM (CB)
-    ########################################
-
-    pid1 = tl.atomic_add(grid_atomic_bmm, 1)
-
-    num_pid_n = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_N)
-    num_pid_m = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_M)
-    while pid1 < num_pid_n * num_pid_m * batch * nchunks * ngroups:
-        pid_n = pid1 % num_pid_n
-        pid_m = (pid1 // num_pid_n) % num_pid_m
-        pid_b = (pid1 // (num_pid_n * num_pid_m)) % batch
-        pid_c = (pid1 // (num_pid_n * num_pid_m * batch)) % nchunks
-        pid_h = (pid1 // (num_pid_n * num_pid_m * batch * nchunks)) % ngroups
+    elif pid_og < num_pids_css + num_pids_bmm:
+        ########################################
+        # BMM (CB)
+        ########################################
+        pid_bmm = pid_og - num_pids_css
+        pid_n = pid_bmm % num_pid_n
+        pid_m = (pid_bmm // num_pid_n) % num_pid_m
+        pid_b = (pid_bmm // (num_pid_n * num_pid_m)) % batch
+        pid_c = (pid_bmm // (num_pid_n * num_pid_m * batch)) % nchunks
+        pid_h = (pid_bmm // (num_pid_n * num_pid_m * batch * nchunks)) % ngroups
         if not IS_CAUSAL or pid_n * BMM_BLOCK_SIZE_N < (pid_m + 1) * BMM_BLOCK_SIZE_M:
             a_ptr = C_ptr + pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + pid_h * stride_C_head
             b_ptr_bmm = b_ptr + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + pid_h * stride_b_head
@@ -781,23 +781,20 @@ def _fused5_ssd_kernel(
             tl.store(out_ptrs_cb, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
         # mark progress
         tl.atomic_add(bmm_wait_ptr + pid_b * bmm_wait_stride_batch + pid_c * bmm_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
-        pid1 = tl.atomic_add(grid_atomic_bmm, 1)
 
-
-    if USE_ATOMIC_PID:
-        pid = tl.atomic_add(grid_atomic, 1)
-    else:
-        pid = tl.program_id(0)
-
+    # is this threadblock for the last 3 fused kernels?
+    if pid_og < (num_pids_css + num_pids_bmm):
+        return
+    pid_fused3 = pid_og - (num_pids_css + num_pids_bmm)
 
     # pids same for all 3 parts
     # all pids represent domain parallelism except pid_c for state passing
     num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
     num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
-    pid_h = pid % nheads
-    pid_c = (pid // (nheads)) % nchunks
-    pid_b = (pid // (nheads * nchunks)) % batch
-    pid_hd = (pid // (nheads * nchunks * batch)) % num_pid_hd
+    pid_h = pid_fused3 % nheads
+    pid_c = (pid_fused3 // (nheads)) % nchunks
+    pid_b = (pid_fused3 // (nheads * nchunks)) % batch
+    pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
 
 
     # wait for this (batch, chunk)
@@ -1115,11 +1112,18 @@ def _fused5_ssd(
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                   if z is not None else (0, 0, 0, 0))
 
-    grid = lambda META: (batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']),)
+    grid = lambda META: (
+        # Chunk Cumsum grid
+        batch * nchunks * triton.cdiv(nheads, META['CCS_BLOCK_SIZE_H']) +
+        # BMM grid
+        triton.cdiv(chunk_size, META['BMM_BLOCK_SIZE_N']) * triton.cdiv(chunk_size, META['BMM_BLOCK_SIZE_M']) * batch * nchunks * ngroups +
+        # fused3 grid
+        batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD'])
+    ,)
 
     # 32 is for cache lines, dstate is not used here
     states_ready_size = batch * nheads * hdim * 32
-    grid_atomic_size = 3 * 32
+    grid_atomic_size = 1 * 32
     bmm_ready_size = batch * nchunks * 32
     cs_ready_size = batch * nchunks * 32
     sync_atomic = torch.zeros((states_ready_size + grid_atomic_size + bmm_ready_size + cs_ready_size,), dtype=torch.int32, device=x.device)
@@ -1127,15 +1131,11 @@ def _fused5_ssd(
     nheads_ngroups_ratio = nheads // ngroups
     _fused5_ssd_kernel[grid](
         # ccs_wait_ptr, ccs_wait_stride_batch, ccs_wait_stride_chunk,
-        # grid_atomic_ccs,
         sync_atomic[states_ready_size + grid_atomic_size + bmm_ready_size: states_ready_size + grid_atomic_size + bmm_ready_size+1],
         nchunks * 32, 32,
-        sync_atomic[states_ready_size + 64: states_ready_size + 65],
         # bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
-        # grid_atomic_bmm,
         sync_atomic[states_ready_size + grid_atomic_size: states_ready_size + grid_atomic_size+1],
         nchunks * 32, 32,
-        sync_atomic[states_ready_size + 32: states_ready_size + 33],
         # grid_atomic, use_atomic_pid
         # sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
         sync_atomic[states_ready_size : states_ready_size + 1], use_atomic_pid,

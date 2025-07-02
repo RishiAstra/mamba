@@ -1,5 +1,6 @@
 # The fused ssd kernel
 
+import math
 from einops import rearrange
 import torch
 import triton
@@ -7,8 +8,7 @@ import triton.language as tl
 
 from packaging import version
 
-from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
+from mamba_ssm.ops.triton.softplus import softplus
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 
@@ -593,6 +593,7 @@ def _fused3_ssd(
             'SP_BLOCK_SIZE_DS': 64,
             'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 32,
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 2,
+            'CCS_BLOCK_SIZE_H': 16,
             }, num_stages=1, num_warps=4, maxnreg=128),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
@@ -600,6 +601,8 @@ def _fused3_ssd(
 # NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
 def _fused5_ssd_kernel(
+    ccs_wait_ptr, ccs_wait_stride_batch, ccs_wait_stride_chunk,
+    grid_atomic_ccs,
     bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
     grid_atomic_bmm,
     grid_atomic, USE_ATOMIC_PID: tl.constexpr,
@@ -645,6 +648,18 @@ def _fused5_ssd_kernel(
     stride_D_head,
 
 
+    ########################################
+    # Originally Chunk Cumsum
+    ########################################
+    # Pointers to matrices
+    A_ptr, dt_bias_ptr, dt_orig_ptr,
+    # Matrix dimension
+    dt_min, dt_max,
+    # Strides
+    stride_dt_orig_batch, stride_dt_orig_seqlen, stride_dt_orig_head,
+    stride_A_head,
+    stride_dt_bias_head,
+
 
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
@@ -654,6 +669,8 @@ def _fused5_ssd_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
     # Block sizes
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, CS_BLOCK_SIZE_CS: tl.constexpr,
     SP_BLOCK_SIZE_DS: tl.constexpr, 
@@ -662,9 +679,57 @@ def _fused5_ssd_kernel(
     BMM_BLOCK_SIZE_N: tl.constexpr,
     BMM_BLOCK_SIZE_K: tl.constexpr,
     BMM_STAGES: tl.constexpr,
+    CCS_BLOCK_SIZE_H: tl.constexpr, 
     # NOTE: not an autotune thing
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
+    
+
+    ########################################
+    # Chunk Cumsum
+    ########################################
+
+    pid2 = tl.atomic_add(grid_atomic_ccs, 1)
+    ccs_num_pid_h = tl.cdiv(nheads, CCS_BLOCK_SIZE_H)
+    while pid2 < batch * nchunks * ccs_num_pid_h:
+        pid_b = pid2 % batch
+        pid_c = (pid2 // batch) % nchunks
+        pid_h = (pid2 // (batch * nchunks)) % ccs_num_pid_h
+
+
+        css_dt_ptr = dt_orig_ptr + pid_b * stride_dt_orig_batch + pid_c * chunk_size * stride_dt_orig_seqlen
+        css_dt_out_ptr = dt_ptr + pid_b * stride_dt_batch + pid_c * stride_dt_chunk
+        css_dA_cumsum_ptr = dA_cumsum_ptr + pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk
+
+        offs_h = pid_h * CCS_BLOCK_SIZE_H + tl.arange(0, CCS_BLOCK_SIZE_H)
+        offs_c = tl.arange(0, BLOCK_SIZE_CHUNK)
+        dt_ptrs = css_dt_ptr + (offs_h[:, None] * stride_dt_orig_head + offs_c[None, :] * stride_dt_orig_seqlen)
+        A_ptrs = A_ptr + offs_h * stride_A_head
+        dt_out_ptrs = css_dt_out_ptr + (offs_h[:, None] * stride_dt_head + offs_c[None, :] * stride_dt_csize)
+        dA_cs_ptrs = css_dA_cumsum_ptr + (offs_h[:, None] * stride_dA_cs_head + offs_c[None, :] * stride_dA_cs_csize)
+        chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+
+        dt = tl.load(dt_ptrs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit), other=0.0).to(tl.float32)
+        if HAS_DT_BIAS:
+            dt_bias = tl.load(dt_bias_ptr + offs_h * stride_dt_bias_head, mask=offs_h < nheads, other=0.0).to(tl.float32)
+            dt += dt_bias[:, None]
+        if DT_SOFTPLUS:
+            dt = tl.where(dt <= 20.0, softplus(dt), dt)
+        # As of Triton 2.2.0, tl.clamp is not available yet
+        # TODO: clamp exists, check if reasonable to assume recent triton version
+        # dt = tl.clamp(dt, dt_min, dt_max)
+        dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
+        dt = tl.where((offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit), dt, 0.0)
+        tl.store(dt_out_ptrs, dt, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size))
+        A = tl.load(A_ptrs, mask=offs_h < nheads, other=0.0).to(tl.float32)
+        dA = dt * A[:, None]
+        dA_cs = tl.cumsum(dA, axis=1)
+        tl.store(dA_cs_ptrs, dA_cs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size))
+
+        # mark progress
+        tl.atomic_add(ccs_wait_ptr + pid_b * ccs_wait_stride_batch + pid_c * ccs_wait_stride_chunk, CCS_BLOCK_SIZE_H, sem='release')
+        pid2 = tl.atomic_add(grid_atomic_ccs, 1)
 
     ########################################
     # BMM (CB)
@@ -740,6 +805,12 @@ def _fused5_ssd_kernel(
     bmm_wait_val = tl.atomic_add(bmm_wait_ptr, 0, sem='acquire')
     while bmm_wait_val < chunk_size * chunk_size * ngroups: # TODO: does not consider of block sizes do not divide chunk size
         bmm_wait_val = tl.atomic_add(bmm_wait_ptr, 0, sem='acquire')
+
+    # wait for this (batch, chunk)
+    ccs_wait_ptr += pid_b * ccs_wait_stride_batch + pid_c * ccs_wait_stride_chunk
+    ccs_wait_val = tl.atomic_add(ccs_wait_ptr, 0, sem='acquire')
+    while ccs_wait_val < nheads:
+        ccs_wait_val = tl.atomic_add(ccs_wait_ptr, 0, sem='acquire')
 
 
     # advance ptrs up front to simplify and slightly reduce register pressure
@@ -989,17 +1060,25 @@ def _fused5_ssd_kernel(
 
 
 def _fused5_ssd(
-    C, B, CB, x, dt, dA_cumsum, out_dtype, D,
-    initial_states=None, seq_idx=None, states_in_fp32=True, z=None, use_atomic_pid=True # if True, don't count on 1d grid launching in order
+    C, B, CB, x, out_dtype, D,
+    dt, A, chunk_size,
+    initial_states=None, seq_idx=None, states_in_fp32=True, z=None, use_atomic_pid=True, # if True, don't count on 1d grid launching in order
+    dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
 ):
-    # setup from chunk state
     batch, seqlen, nheads, hdim = x.shape
-    _, _, nchunks, chunk_size = dt.shape
+
+    # setup from chunk cumsum
+    assert A.shape == (nheads,)
+    if dt_bias is not None:
+        assert dt_bias.shape == (nheads,)
+    nchunks = math.ceil(seqlen / chunk_size)
+    dt_out = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
+    dA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
+
+    # setup from chunk state
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
     assert B.shape == (batch, seqlen, ngroups, dstate)
-    assert dt.shape == (batch, nheads, nchunks, chunk_size)
-    assert dA_cumsum.shape == dt.shape
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
     # TODO: check why chunk state had a `states` parameter
@@ -1040,17 +1119,25 @@ def _fused5_ssd(
 
     # 32 is for cache lines, dstate is not used here
     states_ready_size = batch * nheads * hdim * 32
-    grid_atomic_size = 2 * 32
+    grid_atomic_size = 3 * 32
     bmm_ready_size = batch * nchunks * 32
-    sync_atomic = torch.zeros((states_ready_size + grid_atomic_size + bmm_ready_size,), dtype=torch.int32, device=x.device)
+    cs_ready_size = batch * nchunks * 32
+    sync_atomic = torch.zeros((states_ready_size + grid_atomic_size + bmm_ready_size + cs_ready_size,), dtype=torch.int32, device=x.device)
 
     nheads_ngroups_ratio = nheads // ngroups
     _fused5_ssd_kernel[grid](
+        # ccs_wait_ptr, ccs_wait_stride_batch, ccs_wait_stride_chunk,
+        # grid_atomic_ccs,
+        sync_atomic[states_ready_size + grid_atomic_size + bmm_ready_size: states_ready_size + grid_atomic_size + bmm_ready_size+1],
+        nchunks * 32, 32,
+        sync_atomic[states_ready_size + 64: states_ready_size + 65],
+        # bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
+        # grid_atomic_bmm,
         sync_atomic[states_ready_size + grid_atomic_size: states_ready_size + grid_atomic_size+1],
         nchunks * 32, 32,
+        sync_atomic[states_ready_size + 32: states_ready_size + 33],
         # grid_atomic, use_atomic_pid
         # sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
-        sync_atomic[states_ready_size + 32: states_ready_size + 33],
         sync_atomic[states_ready_size : states_ready_size + 1], use_atomic_pid,
         sync_atomic, nheads * hdim * 32, hdim * 32, 32, 1,
 
@@ -1061,12 +1148,12 @@ def _fused5_ssd(
         # Originally Chunk State
         ########################################
         # Pointers to matrices
-        x, B, states_L, dt, dA_cumsum, seq_idx,# x_ptr, b_ptr, states_L_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
+        x, B, states_L, dt_out, dA_cumsum, seq_idx,# x_ptr, b_ptr, states_L_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
         # Strides
         x.stride(0), x.stride(1), x.stride(2), x.stride(3), # stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
         B.stride(0), B.stride(1), B.stride(2), B.stride(-1), # stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
         states_L.stride(0), states_L.stride(1), states_L.stride(2), states_L.stride(3), states_L.stride(4), # stride_states_L_batch, stride_states_L_chunk, stride_states_L_head, stride_states_L_hdim, stride_states_L_dstate,
-        dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3), # stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+        dt_out.stride(0), dt_out.stride(2), dt_out.stride(1), dt_out.stride(3), # stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
         dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3), # stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
         *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)), # stride_seq_idx_batch, stride_seq_idx_seqlen,
         
@@ -1093,6 +1180,17 @@ def _fused5_ssd(
         C.stride(0), C.stride(1), C.stride(2), C.stride(3),
         D.stride(0) if D is not None else 0,
 
+        ########################################
+        # Originally Chunk Cumsum
+        ########################################
+        # ptrs
+        A, dt_bias, dt,
+        dt_limit[0], dt_limit[1],
+        # strides
+        dt.stride(0), dt.stride(1), dt.stride(2),
+        A.stride(0),
+        dt_bias.stride(0) if dt_bias is not None else 0,
+
 
         # Meta-parameters
         IS_CAUSAL=True,
@@ -1103,6 +1201,9 @@ def _fused5_ssd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+        DT_SOFTPLUS=dt_softplus,
+        HAS_DT_BIAS=dt_bias is not None,
     )
 
-    return out, out_x, states_G, final_states
+    return out, out_x, states_G, final_states, dA_cumsum, dt_out

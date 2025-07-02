@@ -340,10 +340,11 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         # all 3 big kernels fused
         nchunks = math.ceil(seqlen / chunk_size)
         CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32)
-        dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-        out, out_x, states, final_states = _fused5_ssd(
-            C, B, CB, x, dt, dA_cumsum, C.dtype, D, 
-            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z
+        out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
+            C, B, CB, x, C.dtype, D,
+            dt, A, chunk_size,
+            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z,
+            dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
         )
     else:
         print(f"Bad ssd method: {method}")

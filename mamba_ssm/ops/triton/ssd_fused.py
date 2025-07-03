@@ -344,32 +344,14 @@ def _fused5_ssd_kernel(
                 seq_idx_ptrs_cs += BLOCK_SIZE_CS * stride_seq_idx_seqlen
         states = acc.to(states_L_ptr.dtype.element_ty)
 
-        # chunk state final store
-        states_ptrs_cs = states_L_ptr + (offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate)
-        c_mask = (offs_hd[:, None] < hdim) & (offs_ds[None, :] < dstate)
-        tl.store(states_ptrs_cs, states, mask=c_mask, eviction_policy='evict_last')
-
 
 
     ########################################
     # State Passing
     ########################################
 
-    # sp_num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
-    for pid_ds in range(0, sp_num_pid_ds, 1):
-        # Instead of looping over chunks, we have pid_c
-        # first sync (wait for previous), then all must load
-
-        # sync
-        # the atomic represents which pid_c is ready
-        # therefore, wait for it to reach our pid_c
-        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-        while sync_val < pid_c:
-            sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
         offs_ds = pid_ds * SP_BLOCK_SIZE_DS + tl.arange(0, SP_BLOCK_SIZE_DS)
-        states_ptrs = states_L_ptr + offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate
         state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
         final_states_ptrs = final_states_ptr + offs_hd[:, None] * stride_final_states_hdim + offs_ds[None, :] * stride_final_states_dstate
 
@@ -384,13 +366,17 @@ def _fused5_ssd_kernel(
                 states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
             tl.store(state_G_ptrs, states_prev, mask=main_mask)
         else:
+            # sync
+            # the atomic represents which pid_c is ready
+            # therefore, wait for it to reach our pid_c
+            sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+            while sync_val < pid_c:
+                sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
             # need to load states from previous one (but since already offset by 1, just pid_c)
             states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0).to(tl.float32)
 
-        # ptrs
-        state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
 
-        new_states = tl.load(states_ptrs, mask=main_mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        new_states = states
 
         dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
@@ -400,14 +386,17 @@ def _fused5_ssd_kernel(
             seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
         states_mod = scale * states_prev + new_states
+        
+        # ptrs
+        state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
         if pid_c < nchunks - 1:
             tl.store(state_G_ptrs, states_mod, mask=main_mask)
+            # let the next one go
+            tl.atomic_add(sync_atomic, 1, sem='release')
+            sync_atomic += stride_sync_dstate
         else:
             tl.store(final_states_ptrs, states_mod, mask=main_mask)
 
-        # let the next one go
-        tl.atomic_add(sync_atomic, 1, sem='release')
-        sync_atomic += stride_sync_dstate
 
 
 

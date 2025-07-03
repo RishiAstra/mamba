@@ -281,6 +281,7 @@ def _fused5_ssd_kernel(
     cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     C_ptr += pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
     out_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
+    sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim# + pid_ds * stride_sync_dstate
 
     ########################################
     # Chunk State
@@ -289,6 +290,14 @@ def _fused5_ssd_kernel(
     # chunk state ptrs
     if HAS_SEQ_IDX:
         seq_idx_ptr_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+
+    final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+    if HAS_INITSTATES:
+        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+    if HAS_SEQ_IDX:
+        seq_idx_ptr += pid_b * stride_seq_idx_batch
+
+    sp_num_pid_ds = tl.cdiv(dstate, SP_BLOCK_SIZE_DS)
 
     for pid_ds in range(0, num_pid_ds, 1):
         # chunk state offsets
@@ -346,25 +355,16 @@ def _fused5_ssd_kernel(
     # State Passing
     ########################################
 
-    sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim# + pid_ds * stride_sync_dstate
-
     # Instead of looping over chunks, we have pid_c
     # first sync (wait for previous), then all must load
 
     # sync
     # the atomic represents which pid_c is ready
     # therefore, wait for it to reach our pid_c
-    sync_val = tl.atomic_add(sync_atomic, 0)
+    sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
     while sync_val < pid_c:
-        sync_val = tl.atomic_add(sync_atomic, 0)
+        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
 
-    final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
-    if HAS_INITSTATES:
-        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
-    if HAS_SEQ_IDX:
-        seq_idx_ptr += pid_b * stride_seq_idx_batch
-
-    sp_num_pid_ds = tl.cdiv(dstate, SP_BLOCK_SIZE_DS)
     # sp_num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     for pid_ds in range(0, sp_num_pid_ds, 1):
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
@@ -406,7 +406,7 @@ def _fused5_ssd_kernel(
             tl.store(final_states_ptrs, states_mod, mask=main_mask)
 
     # let the next one go
-    tl.atomic_add(sync_atomic, 1)
+    tl.atomic_add(sync_atomic, 1, sem='release')
 
 
 

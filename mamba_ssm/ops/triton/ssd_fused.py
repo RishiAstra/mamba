@@ -14,7 +14,6 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
     configs=[
         triton.Config({
             'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 64, 'BLOCK_SIZE_CS': 64,
-            'SP_BLOCK_SIZE_DS': 64,
             'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 32,
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 2,
             'CCS_BLOCK_SIZE_H': 16,
@@ -95,7 +94,6 @@ def _fused5_ssd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     # Block sizes
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, CS_BLOCK_SIZE_CS: tl.constexpr,
-    SP_BLOCK_SIZE_DS: tl.constexpr, 
     CS_BLOCK_SIZE_DS: tl.constexpr,
     BMM_BLOCK_SIZE_M: tl.constexpr,
     BMM_BLOCK_SIZE_N: tl.constexpr,
@@ -297,8 +295,6 @@ def _fused5_ssd_kernel(
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
-    sp_num_pid_ds = tl.cdiv(dstate, SP_BLOCK_SIZE_DS)
-
     for pid_ds in range(0, num_pid_ds, 1):
         # chunk state offsets
         # NOTE: m ->hdim, n -> dstate, k -> chunk_size
@@ -351,29 +347,21 @@ def _fused5_ssd_kernel(
     ########################################
 
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
-        offs_ds = pid_ds * SP_BLOCK_SIZE_DS + tl.arange(0, SP_BLOCK_SIZE_DS)
+        offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
         state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
         final_states_ptrs = final_states_ptr + offs_hd[:, None] * stride_final_states_hdim + offs_ds[None, :] * stride_final_states_dstate
 
         main_mask = (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
 
-        # special case 0
-        if pid_c == 0:
-            if not HAS_INITSTATES:
-                states_prev = tl.zeros((BLOCK_SIZE_HD, SP_BLOCK_SIZE_DS), dtype=tl.float32)
-            else:
-                initstates_ptrs = initstates_ptr + offs_hd[:, None] * stride_initstates_hdim + offs_ds[None, :] * stride_initstates_dstate
-                states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0).to(tl.float32)
-            tl.store(state_G_ptrs, states_prev, mask=main_mask)
-        else:
-            # sync
-            # the atomic represents which pid_c is ready
-            # therefore, wait for it to reach our pid_c
+        # sync
+        # the atomic represents which pid_c is ready
+        # therefore, wait for it to reach our pid_c
+        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+        while sync_val < pid_c:
             sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-            while sync_val < pid_c:
-                sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-            # need to load states from previous one (but since already offset by 1, just pid_c)
-            states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0).to(tl.float32)
+
+        # need to load states from previous one (but already offset by 1 so no offset)
+        states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0).to(tl.float32)
 
 
         new_states = states
@@ -389,6 +377,7 @@ def _fused5_ssd_kernel(
         
         # ptrs
         state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
+        
         if pid_c < nchunks - 1:
             tl.store(state_G_ptrs, states_mod, mask=main_mask)
             # let the next one go
@@ -565,6 +554,15 @@ def _fused5_ssd(
         # fused3 grid
         batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD'])
     ,)
+
+    # for some reason, it's far faster to do this outside of the kernel
+    # this probably reduces register pressure and instructions a lot
+    if initial_states is not None:
+        # batch, nchunks, nheads, hdim, dstate
+        # batch, nheads, hdim, dstate
+        states_G[:, 0, :, :, :] = initial_states[:, None, :, :, :]
+    else:
+        states_G[:, 0, :, :, :] = 0
 
     # 32 is for cache lines, dstate is not used here
     states_ready_size = batch * nheads * hdim * dstate

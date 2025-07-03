@@ -67,13 +67,14 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1)
-    # (get_test_size(1024 * 2 ** i),) for i in [6] # for quick test
+    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1) #9 for batch=1, 7 for 8, 6 for 32?
+    # (get_test_size(1024 * 2 ** i),) for i in [7] # for quick test
+    # (get_test_size(2753))
 ]
 
 configs.append(
     triton.testing.Benchmark(
-        x_names = ["dims"],
+        x_names = ["dims_b_seq_nh_hd_ng_ds"],
         x_vals = test_sizes,
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         line_vals=[i for i in range(len(things_to_compare))],
@@ -86,8 +87,8 @@ configs.append(
     )
 )
 
-def get_rand_input(dims):
-    batch, seqlen, nheads, headdim, ngroups, dstate = dims
+def get_rand_input(dims_b_seq_nh_hd_ng_ds):
+    batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
     torch.manual_seed(0)
 
     dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.005 + 0.025
@@ -155,10 +156,10 @@ def run_unit_test(seqlen):
 
 
 @triton.testing.perf_report(configs)
-def benchmark(dims, provider):
-    batch, seqlen, nheads, headdim, ngroups, dstate = dims
+def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
+    batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
 
-    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(dims)
+    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(dims_b_seq_nh_hd_ng_ds)
     CHUNK_SIZE=256
 
     quantiles = [0.5, 0.2, 0.8]
@@ -168,13 +169,15 @@ def benchmark(dims, provider):
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus), \
         rep=BENCHMARK_REPEATS, quantiles=quantiles
     )
-    perf = lambda ms: seqlen / (ms * 1e-3)
+    perf = lambda ms: batch * seqlen / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
 if __name__ == "__main__":
     # use to check correctness
     # run_unit_test(1024)
     # run_unit_test(4096)
+    # run_unit_test(2763)
+    # run_unit_test(1783)
     # use to benchmark
     benchmark.run(show_plots=True, print_data=True)
 

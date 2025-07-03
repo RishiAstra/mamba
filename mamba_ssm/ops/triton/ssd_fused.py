@@ -682,6 +682,41 @@ def _fused5_ssd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
+    # some strides must be 64-bit to prevent int32 overflow
+    # for now, only do the batch size for the largest things
+    stride_x_batch = stride_x_batch.to(tl.int64)
+    stride_b_batch = stride_b_batch.to(tl.int64)
+    stride_z_batch = stride_z_batch.to(tl.int64)
+    stride_out_batch = stride_out_batch.to(tl.int64)
+    stride_C_batch = stride_C_batch.to(tl.int64)
+    stride_states_L_batch = stride_states_L_batch.to(tl.int64)
+    stride_states_G_batch = stride_states_G_batch.to(tl.int64)
+    # the following are roughly ordered from largest to smallest
+    # things with batch, seqlen, and ~32*128x more
+    # stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
+    # stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
+    # stride_z_batch, stride_z_seqlen, stride_z_head, stride_z_hdim,
+    # stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
+    # stride_C_batch, stride_C_seqlen, stride_C_head, stride_C_dstate,
+    # stride_states_L_batch, stride_states_L_chunk, stride_states_L_head, stride_states_L_hdim, stride_states_L_dstate,
+    # stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
+    # # things with batch, seqlen, and ~32x more
+    # stride_dt_orig_batch, stride_dt_orig_seqlen, stride_dt_orig_head,
+    # stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+    # stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
+    # stride_cb_batch, stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_k,
+    # # things with batch, seqlen
+    # stride_seq_idx_batch, stride_seq_idx_seqlen,
+    # stride_dA_ccs_batch, stride_dA_ccs_chunk, stride_dA_ccs_head,
+    # # things with batch, ~32*128^2x more
+    # stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
+    # stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
+    # # constant size things
+    # stride_D_head,
+    # stride_A_head,
+    # stride_dt_bias_head,
+
+
     if USE_ATOMIC_PID:
         pid_og = tl.atomic_add(grid_atomic, 1)
     else:

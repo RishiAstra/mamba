@@ -353,7 +353,7 @@ def _fused3_ssd_kernel(
         dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
-            seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
             seq_idx = seq_idx_new
         states_mod = scale * states_prev + new_states
@@ -929,7 +929,6 @@ def _fused5_ssd_kernel(
             states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0).to(tl.float32)
 
         # ptrs
-        seq_idx = 0
         state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
 
         new_states = tl.load(states_ptrs, mask=main_mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
@@ -937,9 +936,10 @@ def _fused5_ssd_kernel(
         dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
-            seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            # TODO: need atomics here?
+            seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
-            seq_idx = seq_idx_new
         states_mod = scale * states_prev + new_states
         if pid_c < nchunks - 1:
             tl.store(state_G_ptrs, states_mod, mask=main_mask)
@@ -1089,7 +1089,6 @@ def _fused5_ssd(
         assert initial_states.shape == (batch, nheads, hdim, dstate)
     if seq_idx is not None:
         assert chunk_size is not None
-        seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
     states_G_dtype = states_L.dtype if out_dtype is None else out_dtype
     states_G = torch.empty((batch, nchunks, nheads, hdim, dstate), device=states_L.device, dtype=states_G_dtype)

@@ -3,6 +3,14 @@
 # TODO: check correctness for out, out_x, dt, dA_cumsum, states, final_states, not just out
 BENCHMARK_REPEATS = 25
 
+
+
+have_init_states    = False
+have_seq_idx        = False
+have_cu_seqlens     = False # TODO: test
+have_dt_softplus    = False # TODO: test
+
+import random
 import torch
 
 import triton
@@ -10,25 +18,24 @@ import triton.language as tl
 import numpy as np
 
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
-
-def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, method=None)
+def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, method=None)
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
-def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, method='fused')
+def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, method='fused')
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
-def run_fullyfused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, method='fullyfused')
+def run_fullyfused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, method='fullyfused')
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
-    (run_fused_ssd, "Fused", "red"),
+    # (run_fused_ssd, "Fused", "red"),
     (run_fullyfused_ssd, "Fully Fused", "green"),
 ]
 
@@ -91,15 +98,43 @@ def get_rand_input(dims):
     D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.01 + 0.3
     x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 0.4
 
-    return dt, dt_bias, A, B, C, D, x
+    if have_init_states:
+        initial_states = torch.randn((batch, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
+    else:
+        initial_states = None
+
+    if have_seq_idx:
+        # example at https://github.com/state-spaces/mamba/issues/383
+
+        seq_idx = torch.zeros((batch, seqlen), dtype=torch.int32, device='cpu')
+        # have at least 1 batch not have multiple sequences if b > 1
+        no_seq_idx_b = -1
+        if batch > 1:
+            no_seq_idx_b = random.randint(0, batch)
+        for b in range(batch):
+            split = random.randint(0, seqlen)
+            while split < seqlen and b != no_seq_idx_b:
+                seq_idx[b, split] = 1
+                split += random.randint(0, seqlen)
+
+        seq_idx = seq_idx.to(device=DEVICE)
+        seq_idx = torch.cumsum(seq_idx, dim=-1).to(torch.int32)
+
+    else:
+        seq_idx = None
+
+    return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, None #, cu_seqlens
 
 
 def run_unit_test(seqlen):
     # raise Exception("Not implemented")
-    dt, dt_bias, A, B, C, D, x = get_rand_input(get_test_size(seqlen))
+    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen))
     CHUNK_SIZE=256
 
-    outputs = [thing[0](x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias) for thing in things_to_compare]
+    outputs = [thing[0](
+            x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
+            initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
+            ) for thing in things_to_compare]
     for i in range(len(outputs)):
         print(f"output for {things_to_compare[i][1]} = {outputs[i]}")
     PRINT_BAD_TENSOR = False
@@ -123,12 +158,14 @@ def run_unit_test(seqlen):
 def benchmark(dims, provider):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims
 
-    dt, dt_bias, A, B, C, D, x = get_rand_input(dims)
+    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(dims)
     CHUNK_SIZE=256
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench( \
-        lambda: things_to_compare[provider][0](x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias), \
+        lambda: things_to_compare[provider][0](
+            x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
+            initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus), \
         rep=BENCHMARK_REPEATS, quantiles=quantiles
     )
     perf = lambda ms: seqlen / (ms * 1e-3)

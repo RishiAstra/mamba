@@ -11,7 +11,7 @@ from packaging import version
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from mamba_ssm.ops.triton.ssd_fused import _fused3_ssd, _fused5_ssd
+from mamba_ssm.ops.triton.ssd_fused import _fused5_ssd
 from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 
 import triton
@@ -25,15 +25,15 @@ try:
 except ImportError:
     causal_conv1d_fn, causal_conv1d_cuda = None, None
 
-from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd, _bmm_chunk_fwd_persistent
-from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd, _chunk_cumsum_fwd_persistent, _chunk_state_fwd_kernel_persistent, _chunk_state_fwd_persistent
+from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
 from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
 from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
 from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref
 from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state_varlen
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd, _state_passing_fwd_kernel_persistent, _state_passing_fwd_persistent, _state_passing_fwd_persistent_gooddims
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
 from mamba_ssm.ops.triton.ssd_state_passing import state_passing, state_passing_ref
-from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates, _chunk_scan_fwd_persistent
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
 from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
 from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
 from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
@@ -279,17 +279,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt.to(dtype=dt.dtype), dD
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), method=None):
-    # # temp print all input sizes
-    # # print(f"B: {B.shape}, x: {x.shape}, dt: {dt.shape}, dA_cumsum: {dA_cumsum.shape}, chunk_size: {chunk_size}, dstate: {dstate}, hdim: {headdim}, nheads: {nheads}, ngroups: {ngroups}, C.dtype: {C.dtype}")
-    # # print(f"dtypes: B: {B.dtype}, x: {x.dtype}, dt: {dt.dtype}, dA_cumsum: {dA_cumsum.dtype}, C: {C.dtype}")
-    # # dt, dt_bias, A, B, C, D, x, chunk_size
-    # print(f"dt: {dt.shape}, dt_bias: {dt_bias.shape}, A: {A.shape}, B: {B.shape}, C: {C.shape}, D: {D.shape if D is not None else None}, x: {x.shape}, chunk_size: {chunk_size}")
-    # print(f"dtypes: dt: {dt.dtype}, dt_bias: {dt_bias.dtype if dt_bias is not None else None}, A: {A.dtype}, B: {B.dtype}, C: {C.dtype}, D: {D.dtype if D is not None else None}, x: {x.dtype}")
-    # # exit
-    # exit(0)
-
-
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), fused=False):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -318,7 +308,15 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
 
-    if method is None:
+    if fused:
+        # all 5 kernels fused
+        out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
+            C, B, x, C.dtype, D,
+            dt, A, chunk_size,
+            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z,
+            dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
+        )
+    else:
         # original
         dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
         states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
@@ -328,36 +326,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
         CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
         out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
-    elif method == 'fused':
-        # all 3 big kernels fused
-        CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-        dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-        out, out_x, states, final_states = _fused3_ssd(
-            C, B, CB, x, dt, dA_cumsum, C.dtype, D, 
-            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z
-        )
-    elif method == 'fullyfused':
-        # all 3 big kernels fused
-        nchunks = math.ceil(seqlen / chunk_size)
-        CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32)
-        out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
-            C, B, CB, x, C.dtype, D,
-            dt, A, chunk_size,
-            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z,
-            dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
-        )
-    else:
-        print(f"Bad ssd method: {method}")
-        exit(1)
 
-
-    # # fused, others persistent
-    # dA_cumsum, dt = _chunk_cumsum_fwd_persistent(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-    # CB = _bmm_chunk_fwd_persistent(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    # # states = _chunk_state_fwd_persistent(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-    # # states, final_states = _state_passing_fwd_persistent_gooddims(states, dA_cumsum, initial_states=initial_states, seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
-    # states, final_states = _fused_chunk_state_state_passing_fwd_persistent(B, x, dt, dA_cumsum, C.dtype, initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True)
-    # out, out_x = _chunk_scan_fwd_persistent(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
 
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states

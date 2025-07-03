@@ -19,42 +19,23 @@ import numpy as np
 
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, method=None)
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, fused=False)
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, method='fused')
-    return outputs[0]
-    # return out, out_x, dt, dA_cumsum, states, final_states
-
-def run_fullyfused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, method='fullyfused')
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, fused=True)
     return outputs[0]
     # return out, out_x, dt, dA_cumsum, states, final_states
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
-    # (run_fused_ssd, "Fused", "red"),
-    (run_fullyfused_ssd, "Fully Fused", "green"),
+    (run_fused_ssd, "Fused", "red"),
 ]
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 configs = []
-
-# dt: torch.Size([1, 6, 80]), dt_bias: torch.Size([80]), A: torch.Size([80]), B: torch.Size([1, 6, 1, 128]),
-# C: torch.Size([1, 6, 1, 128]), D: torch.Size([80]), x: torch.Size([1, 6, 80, 64]), chunk_size: 256
-# dtypes: dt: torch.float16, dt_bias: torch.float16, A: torch.float32, B: torch.float16,
-# C: torch.float16, D: torch.float32, x: torch.float16
-# batch, seqlen, nheads, headdim = x.shape
-# _, _, ngroups, dstate = B.shape
-# assert nheads % ngroups == 0
-# assert B.shape == (batch, seqlen, ngroups, dstate)
-# assert x.shape == (batch, seqlen, nheads, headdim)
-# assert dt.shape == (batch, seqlen, nheads)
-# assert A.shape == (nheads,)
-# assert C.shape == B.shape
 
 batch       = 1
 # seqlen    = whatever

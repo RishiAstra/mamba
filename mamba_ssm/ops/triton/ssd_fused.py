@@ -355,18 +355,18 @@ def _fused5_ssd_kernel(
     # State Passing
     ########################################
 
-    # Instead of looping over chunks, we have pid_c
-    # first sync (wait for previous), then all must load
-
-    # sync
-    # the atomic represents which pid_c is ready
-    # therefore, wait for it to reach our pid_c
-    sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-    while sync_val < pid_c:
-        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-
     # sp_num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     for pid_ds in range(0, sp_num_pid_ds, 1):
+        # Instead of looping over chunks, we have pid_c
+        # first sync (wait for previous), then all must load
+
+        # sync
+        # the atomic represents which pid_c is ready
+        # therefore, wait for it to reach our pid_c
+        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+        while sync_val < pid_c:
+            sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
         offs_ds = pid_ds * SP_BLOCK_SIZE_DS + tl.arange(0, SP_BLOCK_SIZE_DS)
         states_ptrs = states_L_ptr + offs_hd[:, None] * stride_states_L_hdim + offs_ds[None, :] * stride_states_L_dstate
@@ -405,8 +405,9 @@ def _fused5_ssd_kernel(
         else:
             tl.store(final_states_ptrs, states_mod, mask=main_mask)
 
-    # let the next one go
-    tl.atomic_add(sync_atomic, 1, sem='release')
+        # let the next one go
+        tl.atomic_add(sync_atomic, 1, sem='release')
+        sync_atomic += stride_sync_dstate
 
 
 
@@ -577,7 +578,7 @@ def _fused5_ssd(
     ,)
 
     # 32 is for cache lines, dstate is not used here
-    states_ready_size = batch * nheads * hdim * 32
+    states_ready_size = batch * nheads * hdim * dstate
     grid_atomic_size = 1 * 32
     bmm_ready_size = batch * nchunks * 32
     cs_ready_size = batch * nchunks * 32
@@ -594,7 +595,7 @@ def _fused5_ssd(
         # grid_atomic, use_atomic_pid
         # sync_atomic, sync_atomic.stride(0), sync_atomic.stride(1), sync_atomic.stride(2), sync_atomic.stride(3),
         sync_atomic[states_ready_size : states_ready_size + 1], use_atomic_pid,
-        sync_atomic, nheads * hdim * 32, hdim * 32, 32, 1,
+        sync_atomic, nheads * hdim * dstate, hdim * dstate, dstate, 1,
 
         # Matrix dimensions
         hdim, dstate, chunk_size,

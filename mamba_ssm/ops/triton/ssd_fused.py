@@ -381,7 +381,7 @@ def _fused3_ssd_kernel(
 
     for pid_cs in range(0, cs_num_pid_cs, 1): # pid_other, num_pid_cs, num_pid_ds*CS_BLOCK_HD_MULT):
         if HAS_SEQ_IDX:
-            seq_idx_ptr = seq_idx_ptr_og + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+            seq_idx_ptr = seq_idx_ptr_og + pid_c * chunk_size * stride_seq_idx_seqlen
 
         offs_cs = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
@@ -749,7 +749,7 @@ def _fused5_ssd_kernel(
             a_ptr = C_ptr + pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + pid_h * stride_C_head
             b_ptr_bmm = b_ptr + pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + pid_h * stride_b_head
             if HAS_SEQ_IDX:
-                seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+                bmm_seq_idx_ptr = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
             offs_m = pid_m * BMM_BLOCK_SIZE_M + tl.arange(0, BMM_BLOCK_SIZE_M)
             offs_n = pid_n * BMM_BLOCK_SIZE_N + tl.arange(0, BMM_BLOCK_SIZE_N)
@@ -771,12 +771,12 @@ def _fused5_ssd_kernel(
             offs_n = pid_n * BMM_BLOCK_SIZE_N + tl.arange(0, BMM_BLOCK_SIZE_N)
             if HAS_SEQ_IDX:
                 chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-                seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
-                seq_idx_n = tl.load(seq_idx_ptr + offs_n * stride_seq_idx_seqlen, mask=offs_n < chunk_size_limit, other=-2)
+                seq_idx_m = tl.load(bmm_seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
+                seq_idx_n = tl.load(bmm_seq_idx_ptr + offs_n * stride_seq_idx_seqlen, mask=offs_n < chunk_size_limit, other=-2)
                 acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
-            out = acc.to(out_ptr.dtype.element_ty)
+            out = acc.to(cb_ptr.dtype.element_ty)
 
-            out_ptr_cb = cb_ptr + pid_b * stride_out_batch + pid_c * stride_cb_chunk + pid_h * stride_out_head
+            out_ptr_cb = cb_ptr + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + pid_h * stride_cb_head
             out_ptrs_cb = out_ptr_cb + (stride_cb_csize_m * offs_m[:, None] + offs_n[None, :] * stride_cb_csize_k)
             tl.store(out_ptrs_cb, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
         # mark progress

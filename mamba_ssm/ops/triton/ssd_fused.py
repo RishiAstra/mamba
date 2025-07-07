@@ -25,8 +25,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 # NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
 def _fused5_ssd_kernel(
-    ccs_wait_ptr, ccs_wait_stride_batch, ccs_wait_stride_chunk,
-    bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
+    first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk,
     grid_atomic, USE_ATOMIC_PID: tl.constexpr,
     sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
 
@@ -86,7 +85,6 @@ def _fused5_ssd_kernel(
     HAS_Z: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
-    HAS_INITSTATES: tl.constexpr,
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     # Block sizes
@@ -186,7 +184,7 @@ def _fused5_ssd_kernel(
         tl.store(dA_cs_ptrs, dA_cs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size))
 
         # mark progress
-        tl.atomic_add(ccs_wait_ptr + pid_b * ccs_wait_stride_batch + pid_c * ccs_wait_stride_chunk, CCS_BLOCK_SIZE_H, sem='release')
+        tl.atomic_add(first2_wait_ptr + pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk, CCS_BLOCK_SIZE_H, sem='release')
 
     elif pid_og < num_pids_css + num_pids_bmm:
         ########################################
@@ -233,7 +231,7 @@ def _fused5_ssd_kernel(
             out_ptrs_cb = out_ptr_cb + (stride_cb_csize_m * offs_m[:, None] + offs_n[None, :] * stride_cb_csize_k)
             tl.store(out_ptrs_cb, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
         # mark progress
-        tl.atomic_add(bmm_wait_ptr + pid_b * bmm_wait_stride_batch + pid_c * bmm_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
+        tl.atomic_add(first2_wait_ptr + pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
 
     # is this threadblock for the last 3 fused kernels?
     if pid_og < (num_pids_css + num_pids_bmm):
@@ -249,19 +247,12 @@ def _fused5_ssd_kernel(
     pid_b = (pid_fused3 // (nheads * nchunks)) % batch
     pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
 
-
     # wait for this (batch, chunk)
-    bmm_wait_ptr += pid_b * bmm_wait_stride_batch + pid_c * bmm_wait_stride_chunk
-    bmm_wait_val = tl.atomic_add(bmm_wait_ptr, 0, sem='acquire')
-    while bmm_wait_val < chunk_size * chunk_size * ngroups: # TODO: does not consider of block sizes do not divide chunk size
-        bmm_wait_val = tl.atomic_add(bmm_wait_ptr, 0, sem='acquire')
-
-    # wait for this (batch, chunk)
-    ccs_wait_ptr += pid_b * ccs_wait_stride_batch + pid_c * ccs_wait_stride_chunk
-    ccs_wait_val = tl.atomic_add(ccs_wait_ptr, 0, sem='acquire')
-    while ccs_wait_val < nheads:
-        ccs_wait_val = tl.atomic_add(ccs_wait_ptr, 0, sem='acquire')
-
+    first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
+    first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
+    # includes both, cumsum + bmm
+    while first2_wait_val < nheads + num_pid_n * BMM_BLOCK_SIZE_N * num_pid_m * BMM_BLOCK_SIZE_M * ngroups:
+        first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
 
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
@@ -386,14 +377,13 @@ def _fused5_ssd_kernel(
     # cs_num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS)
 
-    seq_idx_ptr_og = seq_idx_ptr
-    out_x_ptr_og = out_x_ptr
-    z_ptr_og = z_ptr
+    if HAS_SEQ_IDX:
+        seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+    if HAS_Z:
+        out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
+        z_ptr += pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
 
     for pid_cs in range(0, cs_num_pid_cs, 1): # pid_other, num_pid_cs, num_pid_ds*CS_BLOCK_HD_MULT):
-        if HAS_SEQ_IDX:
-            seq_idx_ptr = seq_idx_ptr_og + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
-
         offs_cs = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
         dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize, mask=offs_cs < chunk_size, other=0.0).to(tl.float32)
@@ -470,11 +460,9 @@ def _fused5_ssd_kernel(
             acc += x_residual * D
 
         if HAS_Z:
-            out_x_ptr = out_x_ptr_og + pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
             out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :])
             tl.store(out_x_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim))
 
-            z_ptr = z_ptr_og + pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
             z_ptrs = z_ptr + (stride_z_seqlen * offs_out_m[:, None] + stride_z_hdim * offs_out_n[None, :])
             z = tl.load(z_ptrs, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim), other=0.0).to(tl.float32)
             acc *= z * tl.sigmoid(z)
@@ -556,14 +544,10 @@ def _fused5_ssd(
     states_ready_size = batch * nheads * hdim * dstate
     grid_atomic_size = 1 * 32
     bmm_ready_size = batch * nchunks * 32
-    cs_ready_size = batch * nchunks * 32
-    sync_atomic = torch.zeros((states_ready_size + grid_atomic_size + bmm_ready_size + cs_ready_size,), dtype=torch.int32, device=x.device)
+    sync_atomic = torch.zeros((states_ready_size + grid_atomic_size + bmm_ready_size,), dtype=torch.int32, device=x.device)
 
     nheads_ngroups_ratio = nheads // ngroups
     _fused5_ssd_kernel[grid](
-        # ccs_wait_ptr, ccs_wait_stride_batch, ccs_wait_stride_chunk,
-        sync_atomic[states_ready_size + grid_atomic_size + bmm_ready_size: states_ready_size + grid_atomic_size + bmm_ready_size+1],
-        nchunks * 32, 32,
         # bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
         sync_atomic[states_ready_size + grid_atomic_size: states_ready_size + grid_atomic_size+1],
         nchunks * 32, 32,
@@ -627,7 +611,6 @@ def _fused5_ssd(
         HAS_Z=z is not None,
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
-        HAS_INITSTATES=initial_states is not None,
         BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,

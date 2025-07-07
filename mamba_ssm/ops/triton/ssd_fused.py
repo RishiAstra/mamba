@@ -1,6 +1,7 @@
 # The fused-5 ssd kernel
 
 import math
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -413,7 +414,7 @@ def _fused5_ssd_kernel(
         if HAS_SEQ_IDX:
             seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
             seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
-        acc = tl.zeros((CS_BLOCK_SIZE_CS, BLOCK_SIZE_HD), dtype=tl.float32)
+        acc = tl.zeros((CS_BLOCK_SIZE_CS, BLOCK_SIZE_HD), dtype=tl.float16)
 
         # Without the if (pid_c > -1), with Triton 2.1.0, I get
         # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
@@ -431,7 +432,7 @@ def _fused5_ssd_kernel(
                 C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
                 prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim), other=0.0)
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                acc = tl.dot(C, prev_states) * scale_m[:, None]
+                acc = tl.dot(C, prev_states, out_dtype=tl.float16) * (scale_m[:, None]).to(tl.float16)
             else:
                 for k in range(0, dstate, CS_BLOCK_SIZE_DS):
                     C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
@@ -441,7 +442,7 @@ def _fused5_ssd_kernel(
                     acc += tl.dot(C, prev_states)
                     C_ptrs += CS_BLOCK_SIZE_DS
                     prev_states_ptrs += CS_BLOCK_SIZE_DS
-                acc *= scale_m[:, None]
+                acc *= (scale_m[:, None]).to(tl.float16)
 
         offs_k = tl.arange(0, CS_BLOCK_SIZE_DS)
         cb_ptrs = cb_ptr + (offs_cs[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
@@ -450,19 +451,19 @@ def _fused5_ssd_kernel(
         dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
         K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS, chunk_size_limit)
         for k in range(0, K_MAX, CS_BLOCK_SIZE_DS):
-            cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last').to(tl.float32)
+            cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')#.to(tl.float32)
             dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
             # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
             # So we don't need masking wrt seq_idx here.
-            cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :]))
-            dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
+            cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(tl.float16)
+            dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float16)#.to(tl.float32)
             cb *= dt_k
             if IS_CAUSAL:
                 mask = offs_cs[:, None] >= k + offs_k[None, :]
                 cb = tl.where(mask, cb, 0.0)
             cb = cb.to(x_ptr.dtype.element_ty)
             x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
-            acc += tl.dot(cb, x)
+            acc += tl.dot(cb, x, out_dtype=tl.float16)
             cb_ptrs += CS_BLOCK_SIZE_DS * stride_cb_csize_k
             x_ptrs += CS_BLOCK_SIZE_DS * stride_x_seqlen
             dt_ptrs += CS_BLOCK_SIZE_DS * stride_dt_csize
@@ -497,7 +498,7 @@ def _fused5_ssd_kernel(
 def _fused5_ssd(
     C, B, x, out_dtype, D,
     dt, A, chunk_size,
-    initial_states=None, seq_idx=None, states_in_fp32=True, z=None, use_atomic_pid=True, # if True, don't count on 1d grid launching in order
+    initial_states=None, seq_idx=None, states_in_fp32=False, z=None, use_atomic_pid=True, # if True, don't count on 1d grid launching in order
     dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
 ):
     batch, seqlen, nheads, hdim = x.shape
@@ -517,7 +518,7 @@ def _fused5_ssd(
     states_dtype = torch.float32 if states_in_fp32 else B.dtype
     states_L = torch.empty((batch, nchunks, nheads, hdim, dstate), device=x.device, dtype=states_dtype)
     # setup from bmm
-    CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32)
+    CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float16)
     # setup from state passing
     dA_chunk_cumsum = dA_cumsum[:, :, :, -1]
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
@@ -528,7 +529,7 @@ def _fused5_ssd(
         assert seq_idx.shape == (batch, seqlen)
     states_G_dtype = states_L.dtype if out_dtype is None else out_dtype
     states_G = torch.empty((batch, nchunks, nheads, hdim, dstate), device=states_L.device, dtype=states_G_dtype)
-    final_states = torch.empty((batch, nheads, hdim, dstate), device=states_L.device, dtype=torch.float32)
+    final_states = torch.empty((batch, nheads, hdim, dstate), device=states_L.device, dtype=states_G_dtype)
     # setup from chunk scan
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert CB.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)

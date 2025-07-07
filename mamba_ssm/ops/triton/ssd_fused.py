@@ -37,11 +37,10 @@ def _fused5_ssd_kernel(
     # Originally Chunk State
     ########################################
     # Pointers to matrices
-    x_ptr, b_ptr, states_L_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
+    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
     # Strides
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
     stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
-    stride_states_L_batch, stride_states_L_chunk, stride_states_L_head, stride_states_L_hdim, stride_states_L_dstate,
     stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
     stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
@@ -50,12 +49,10 @@ def _fused5_ssd_kernel(
     # Originally State Passing
     ########################################
     # Pointers to matrices
-    states_G_ptr, final_states_ptr, dA_ccs_ptr, initstates_ptr, # ccs = chunk_cumsum
+    states_G_ptr, final_states_ptr,
     # Strides
     stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
     stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
-    stride_dA_ccs_batch, stride_dA_ccs_chunk, stride_dA_ccs_head,
-    stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
 
     ########################################
     # Originally Chunk Scan
@@ -112,7 +109,6 @@ def _fused5_ssd_kernel(
     stride_z_batch = stride_z_batch.to(tl.int64)
     stride_out_batch = stride_out_batch.to(tl.int64)
     stride_C_batch = stride_C_batch.to(tl.int64)
-    stride_states_L_batch = stride_states_L_batch.to(tl.int64)
     stride_states_G_batch = stride_states_G_batch.to(tl.int64)
     # the following are roughly ordered from largest to smallest
     # things with batch, seqlen, and ~32*128x more
@@ -275,8 +271,6 @@ def _fused5_ssd_kernel(
     b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
     dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
-    states_L_ptr += pid_b * stride_states_L_batch + pid_c * stride_states_L_chunk + pid_h * stride_states_L_head
-    dA_ccs_ptr += pid_b * stride_dA_ccs_batch + pid_h * stride_dA_ccs_head + stride_dA_ccs_chunk * pid_c
     cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     C_ptr += pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
     out_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
@@ -291,8 +285,6 @@ def _fused5_ssd_kernel(
         seq_idx_ptr_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
     final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
-    if HAS_INITSTATES:
-        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
@@ -339,7 +331,7 @@ def _fused5_ssd_kernel(
             dA_cumsum_ptrs_cs += BLOCK_SIZE_CS * stride_dA_cs_csize
             if HAS_SEQ_IDX:
                 seq_idx_ptrs_cs += BLOCK_SIZE_CS * stride_seq_idx_seqlen
-        states = acc.to(states_L_ptr.dtype.element_ty)
+        states = acc.to(states_G_ptr.dtype.element_ty)
 
 
 
@@ -367,7 +359,8 @@ def _fused5_ssd_kernel(
 
         new_states = states
 
-        dA_cs = tl.load(dA_ccs_ptr).to(tl.float32)
+        # offset gets us to the end of each chunk
+        dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             # TODO: need atomics here?
@@ -517,7 +510,6 @@ def _fused5_ssd(
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
     states_dtype = torch.float32 if states_in_fp32 else B.dtype
-    states_L = torch.empty((batch, nchunks, nheads, hdim, dstate), device=x.device, dtype=states_dtype)
     # setup from bmm
     CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float16)
     # setup from state passing
@@ -528,9 +520,9 @@ def _fused5_ssd(
     if seq_idx is not None:
         assert chunk_size is not None
         assert seq_idx.shape == (batch, seqlen)
-    states_G_dtype = states_L.dtype if out_dtype is None else out_dtype
-    states_G = torch.empty((batch, nchunks, nheads, hdim, dstate), device=states_L.device, dtype=states_G_dtype)
-    final_states = torch.empty((batch, nheads, hdim, dstate), device=states_L.device, dtype=states_G_dtype)
+    states_G_dtype = states_dtype if out_dtype is None else out_dtype
+    states_G = torch.empty((batch, nchunks, nheads, hdim, dstate), device=x.device, dtype=states_G_dtype)
+    final_states = torch.empty((batch, nheads, hdim, dstate), device=x.device, dtype=states_G_dtype)
     # setup from chunk scan
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert CB.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
@@ -593,11 +585,10 @@ def _fused5_ssd(
         # Originally Chunk State
         ########################################
         # Pointers to matrices
-        x, B, states_L, dt_out, dA_cumsum, seq_idx,# x_ptr, b_ptr, states_L_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
+        x, B, dt_out, dA_cumsum, seq_idx,# x_ptr, b_ptr, states_L_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
         # Strides
         x.stride(0), x.stride(1), x.stride(2), x.stride(3), # stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
         B.stride(0), B.stride(1), B.stride(2), B.stride(-1), # stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
-        states_L.stride(0), states_L.stride(1), states_L.stride(2), states_L.stride(3), states_L.stride(4), # stride_states_L_batch, stride_states_L_chunk, stride_states_L_head, stride_states_L_hdim, stride_states_L_dstate,
         dt_out.stride(0), dt_out.stride(2), dt_out.stride(1), dt_out.stride(3), # stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
         dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3), # stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
         *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)), # stride_seq_idx_batch, stride_seq_idx_seqlen,
@@ -606,12 +597,10 @@ def _fused5_ssd(
         # Originally State Passing
         ########################################
         # Pointers to matrices
-        states_G, final_states, dA_chunk_cumsum, initial_states,
+        states_G, final_states,
         # Strides
         states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
         final_states.stride(0), final_states.stride(1), final_states.stride(2), final_states.stride(3),
-        dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
-        *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2), initial_states.stride(3)) if initial_states is not None else (0, 0, 0, 0)),
 
         ########################################
         # Originally Chunk Scan

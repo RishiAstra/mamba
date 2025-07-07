@@ -13,6 +13,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
+USE_GIVEN_TEST_TENSORS = False
+
+
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
@@ -45,6 +48,13 @@ print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.re
 torch.random.manual_seed(0)
 if args.prompt is None:
     input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
+    if USE_GIVEN_TEST_TENSORS:
+        txt_lorem = ''
+        with open('lorem.txt') as lorem:
+            txt_lorem = lorem.read()
+        tokens_lorem = tokenizer(txt_lorem, return_tensors="pt").input_ids.to(device=device)
+        cpy_len = min(args.promptlen, tokens_lorem.shape[1])
+        input_ids[:, :cpy_len] = tokens_lorem[:, :cpy_len]
     attn_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
 else:
     tokens = tokenizer(args.prompt, return_tensors="pt")
@@ -82,6 +92,9 @@ else:
 out = fn()
 if args.prompt is not None:
     print(tokenizer.batch_decode(out.sequences.tolist()))
+elif USE_GIVEN_TEST_TENSORS:
+    with open('out_temp.txt', 'w') as o:
+        print(tokenizer.batch_decode(out.sequences.tolist()), file=o)
 
 torch.cuda.synchronize()
 start = time.time()

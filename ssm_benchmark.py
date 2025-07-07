@@ -10,6 +10,10 @@ have_seq_idx        = False
 have_cu_seqlens     = False # TODO: test
 have_dt_softplus    = False # TODO: test
 
+USE_GIVEN_TEST_TENSORS = True
+atol_rand = 5e-2
+atol_given = 5e-4
+
 import random
 import torch
 
@@ -80,6 +84,24 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds):
     D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.01 + 0.3
     x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 0.4
 
+    if USE_GIVEN_TEST_TENSORS:
+        dt_in = torch.load("dump/dt_in.txt")
+        dt_bias_in = torch.load("dump/dt_bias_in.txt")
+        A_in = torch.load("dump/A_in.txt")
+        B_in = torch.load("dump/B_in.txt")
+        C_in = torch.load("dump/C_in.txt")
+        D_in = torch.load("dump/D_in.txt")
+        x_in = torch.load("dump/x_in.txt")
+        # assign
+        seq_min = min(seqlen, B_in.shape[1])
+        dt[:, :seq_min] = dt_in[:, :seq_min]
+        dt_bias = dt_bias_in
+        A = A_in
+        B[:, :seq_min] = B_in[:, :seq_min]
+        C[:, :seq_min] = C_in[:, :seq_min]
+        D = D_in
+        x[:, :seq_min] = x_in[:, :seq_min]
+
     if have_init_states:
         initial_states = torch.randn((batch, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
     else:
@@ -123,14 +145,17 @@ def run_unit_test(seqlen):
     bad_i = -1
     # compare all to the first
     for i in range(1, len(outputs), 1):
-        if torch.allclose(outputs[i], outputs[0], atol=5e-2, rtol=1e-2, equal_nan=True):
+        if torch.allclose(outputs[i], outputs[0], atol=atol_given if USE_GIVEN_TEST_TENSORS else atol_rand, rtol=1e-2, equal_nan=True):
             print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")
         else:
             print(f"❌ {things_to_compare[i][1]} and {things_to_compare[0][1]} differ")
-            max_diff_idx = torch.argmax(torch.abs(outputs[i] - outputs[0]))
-            max_diff = torch.abs(outputs[i].reshape(-1)[max_diff_idx] - outputs[0].reshape(-1)[max_diff_idx])
-            print(f"max diff: {max_diff} for {max_diff_idx} index, a: {outputs[i].reshape(-1)[max_diff_idx]}, b: {outputs[0].reshape(-1)[max_diff_idx]}")
             bad_i = i
+        max_diff_idx = torch.argmax(torch.abs(outputs[i] - outputs[0]))
+        max_diff = torch.abs(outputs[i].reshape(-1)[max_diff_idx] - outputs[0].reshape(-1)[max_diff_idx])
+        print(f"max diff: {max_diff} for {max_diff_idx} index, a: {outputs[i].reshape(-1)[max_diff_idx]}, b: {outputs[0].reshape(-1)[max_diff_idx]}")
+        max_rdiff_idx = torch.argmax(torch.abs((outputs[i] - outputs[0]) / outputs[0]))
+        max_rdiff = torch.abs((outputs[i].reshape(-1)[max_rdiff_idx] - outputs[0].reshape(-1)[max_rdiff_idx] / outputs[0].reshape(-1)[max_rdiff_idx]))
+        print(f"max rel diff: {max_rdiff} for {max_rdiff_idx} index, a: {outputs[i].reshape(-1)[max_rdiff_idx]}, b: {outputs[0].reshape(-1)[max_rdiff_idx]}")
 
     if bad_i >= 0 and PRINT_BAD_TENSOR:
         np.savetxt('bad_output.txt', outputs[bad_i].cpu().numpy(), fmt="%.2e")

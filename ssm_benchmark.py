@@ -10,7 +10,7 @@ have_seq_idx        = False
 have_cu_seqlens     = False # TODO: test
 have_dt_softplus    = False # TODO: test
 
-USE_GIVEN_TEST_TENSORS = True
+USE_GIVEN_TEST_TENSORS = False
 atol_rand = 5e-2
 atol_given = 5e-4
 
@@ -76,13 +76,13 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
     torch.manual_seed(0)
 
-    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.005 + 0.025
-    dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE) * 0.01
-    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.005 + 0.02
-    B = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 0.1 + 0.3
-    C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 0.1 + 0.3
-    D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.01 + 0.3
-    x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 0.4
+    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.8
+    dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE) * 0.5 - 5
+    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 2 - 10
+    B = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 3 + 7
+    C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 5 + 20
+    D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.5 + 1.2
+    x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 2 + 5
 
     if USE_GIVEN_TEST_TENSORS:
         dt_in = torch.load("dump/dt_in.txt")
@@ -182,8 +182,8 @@ if __name__ == "__main__":
     # use to check correctness
     # run_unit_test(1024)
     # run_unit_test(4096)
-    # run_unit_test(2763)
+    run_unit_test(2763)
     # run_unit_test(1783)
     # use to benchmark
-    benchmark.run(show_plots=True, print_data=True)
+    # benchmark.run(show_plots=True, print_data=True)
 

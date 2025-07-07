@@ -383,9 +383,10 @@ def _fused5_ssd_kernel(
             tl.store(state_G_ptrs, states_mod, mask=main_mask)
             # let the next one go
             tl.atomic_add(sync_atomic, 1, sem='release')
-            sync_atomic += stride_sync_dstate
         else:
             tl.store(final_states_ptrs, states_mod, mask=main_mask)
+
+        sync_atomic += stride_sync_dstate
 
 
 

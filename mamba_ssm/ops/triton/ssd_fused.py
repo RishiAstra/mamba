@@ -209,12 +209,12 @@ def _fused5_ssd_kernel(
             b_ptrs = b_ptr_bmm + (offs_k[:, None] * stride_b_dstate + offs_n[None, :] * stride_b_seqlen)
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
-            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float32)
+            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=cb_ptr.dtype.element_ty)
             # for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
             for k in tl.range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K), num_stages=BMM_STAGES):
-                a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0).to(C_ptr.dtype.element_ty)
-                b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0).to(C_ptr.dtype.element_ty)
-                acc += tl.dot(a, b)
+                a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0)
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0)
+                acc += tl.dot(a, b, out_dtype=acc.dtype)
                 a_ptrs += BMM_BLOCK_SIZE_K * stride_C_dstate
                 b_ptrs += BMM_BLOCK_SIZE_K * stride_b_dstate
 
@@ -225,11 +225,10 @@ def _fused5_ssd_kernel(
                 seq_idx_m = tl.load(bmm_seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
                 seq_idx_n = tl.load(bmm_seq_idx_ptr + offs_n * stride_seq_idx_seqlen, mask=offs_n < chunk_size_limit, other=-2)
                 acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
-            out = acc.to(cb_ptr.dtype.element_ty)
 
             out_ptr_cb = cb_ptr + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + pid_h * stride_cb_head
             out_ptrs_cb = out_ptr_cb + (stride_cb_csize_m * offs_m[:, None] + offs_n[None, :] * stride_cb_csize_k)
-            tl.store(out_ptrs_cb, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+            tl.store(out_ptrs_cb, acc, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
         # mark progress
         tl.atomic_add(first2_wait_ptr + pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
 
@@ -299,10 +298,10 @@ def _fused5_ssd_kernel(
             seq_idx_last = tl.load(seq_idx_ptr_cs + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
         # chunk state chunk_size loop
-        acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
         for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
             x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
-            b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first').to(tl.float32)
+            b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
             dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
             if HAS_SEQ_IDX:
                 seq_idx_k = tl.load(seq_idx_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=-1)
@@ -311,16 +310,15 @@ def _fused5_ssd_kernel(
                 scale = tl.exp((dA_cs_last - dA_cs_k)) * dt_k
             else:
                 scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
-            b *= scale[:, None]
-            b = b.to(x_ptr.dtype.element_ty)
-            acc += tl.dot(x, b)
+            b *= (scale[:, None]).to(x_ptr.dtype.element_ty)
+            acc += tl.dot(x, b, out_dtype=acc.dtype)
             x_ptrs_cs += BLOCK_SIZE_CS * stride_x_seqlen
             b_ptrs_cs += BLOCK_SIZE_CS * stride_b_seqlen
             dt_ptrs_cs += BLOCK_SIZE_CS * stride_dt_csize
             dA_cumsum_ptrs_cs += BLOCK_SIZE_CS * stride_dA_cs_csize
             if HAS_SEQ_IDX:
                 seq_idx_ptrs_cs += BLOCK_SIZE_CS * stride_seq_idx_seqlen
-        states = acc.to(states_G_ptr.dtype.element_ty)
+        states = acc
 
 
 
@@ -334,18 +332,8 @@ def _fused5_ssd_kernel(
 
         main_mask = (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
 
-        # sync
-        # the atomic represents which pid_c is ready
-        # therefore, wait for it to reach our pid_c
-        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-        while sync_val < pid_c:
-            sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-
-        # need to load states from previous one (but already offset by 1 so no offset)
-        states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0).to(tl.float32)
 
 
-        new_states = states
 
         # offset gets us to the end of each chunk
         dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
@@ -355,7 +343,17 @@ def _fused5_ssd_kernel(
             seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
-        states_mod = scale * states_prev + new_states
+        # sync
+        # the atomic represents which pid_c is ready
+        # therefore, wait for it to reach our pid_c
+        sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+        while sync_val < pid_c:
+            sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+
+        # need to load states from previous one (but already offset by 1 so no offset)
+        states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+
+        states_mod = scale * states_prev + states # NOTE: scale.to(tl.float16) seems to slow it down
         
         # ptrs
         state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
@@ -392,7 +390,7 @@ def _fused5_ssd_kernel(
         if HAS_SEQ_IDX:
             seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
             seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
-        acc = tl.zeros((CS_BLOCK_SIZE_CS, BLOCK_SIZE_HD), dtype=tl.float16)
+        acc = tl.zeros((CS_BLOCK_SIZE_CS, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty)
 
         # Without the if (pid_c > -1), with Triton 2.1.0, I get
         # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
@@ -410,17 +408,16 @@ def _fused5_ssd_kernel(
                 C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
                 prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim), other=0.0)
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                acc = tl.dot(C, prev_states, out_dtype=tl.float16) * (scale_m[:, None]).to(tl.float16)
+                acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(acc.dtype)
             else:
                 for k in range(0, dstate, CS_BLOCK_SIZE_DS):
                     C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
-                    # C = (C * scale_m[:, None]).to(C_ptr.dtype.element_ty)
                     prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_hd[None, :] < hdim), other=0.0)
                     prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                    acc += tl.dot(C, prev_states)
+                    acc += tl.dot(C, prev_states, out_dtype=acc.dtype)
                     C_ptrs += CS_BLOCK_SIZE_DS
                     prev_states_ptrs += CS_BLOCK_SIZE_DS
-                acc *= (scale_m[:, None]).to(tl.float16)
+                acc *= (scale_m[:, None]).to(acc.dtype)
 
         offs_k = tl.arange(0, CS_BLOCK_SIZE_DS)
         cb_ptrs = cb_ptr + (offs_cs[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
@@ -429,19 +426,19 @@ def _fused5_ssd_kernel(
         dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
         K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS, chunk_size_limit)
         for k in range(0, K_MAX, CS_BLOCK_SIZE_DS):
-            cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')#.to(tl.float32)
+            cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
             dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
             # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
             # So we don't need masking wrt seq_idx here.
-            cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(tl.float16)
-            dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float16)#.to(tl.float32)
+            cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
+            dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
             cb *= dt_k
             if IS_CAUSAL:
                 mask = offs_cs[:, None] >= k + offs_k[None, :]
                 cb = tl.where(mask, cb, 0.0)
             cb = cb.to(x_ptr.dtype.element_ty)
             x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
-            acc += tl.dot(cb, x, out_dtype=tl.float16)
+            acc += tl.dot(cb, x, out_dtype=acc.dtype)
             cb_ptrs += CS_BLOCK_SIZE_DS * stride_cb_csize_k
             x_ptrs += CS_BLOCK_SIZE_DS * stride_x_seqlen
             dt_ptrs += CS_BLOCK_SIZE_DS * stride_dt_csize
@@ -452,11 +449,11 @@ def _fused5_ssd_kernel(
 
         if HAS_D:
             if D_HAS_HDIM:
-                D = tl.load(D_ptr + pid_h * stride_D_head + offs_hd, mask=offs_hd < hdim, other=0.0).to(tl.float32)
+                D = tl.load(D_ptr + pid_h * stride_D_head + offs_hd, mask=offs_hd < hdim, other=0.0)
             else:
-                D = tl.load(D_ptr + pid_h * stride_D_head).to(tl.float32)
+                D = tl.load(D_ptr + pid_h * stride_D_head)
             x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
-                                mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0).to(tl.float32)
+                                mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0)
             acc += x_residual * D
 
         if HAS_Z:

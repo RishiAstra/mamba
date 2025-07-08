@@ -24,7 +24,11 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 )
 @triton.heuristics(values={
     'NEED_MASK_HD': lambda args: args['hdim'] / args['BLOCK_SIZE_HD'] != args['hdim'] // args['BLOCK_SIZE_HD'],
-    'NEED_MASK_CS_DS': lambda args: args['dstate'] / args['CS_BLOCK_SIZE_DS'] != args['dstate'] // args['CS_BLOCK_SIZE_DS'],
+    'NEED_MASK_CS_DS': lambda args: args['dstate'] / args['CS_BLOCK_SIZE_DS'] != args['dstate'] // args['CS_BLOCK_SIZE_DS'] or args['dstate'] != args['BLOCK_SIZE_DSTATE'],
+    # TODO: fix confusion and CS_BLOCK_SIZE_DS also being used for chunk size
+    'NEED_MASK_CS_CS_inner': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_DS'] != args['chunk_size'] // args['CS_BLOCK_SIZE_DS'],
+    'NEED_MASK_CS_CS_outer': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS'],
+    'NEED_MASK_1_DS': lambda args: args['dstate'] / args['BLOCK_SIZE_DS'] != args['dstate'] // args['BLOCK_SIZE_DS'],
 })
 # NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
@@ -105,7 +109,15 @@ def _fused5_ssd_kernel(
     # heuristic bools
     NEED_MASK_HD: tl.constexpr,
     NEED_MASK_CS_DS: tl.constexpr,
+    NEED_MASK_CS_CS_outer: tl.constexpr,
+    NEED_MASK_CS_CS_inner: tl.constexpr,
+    NEED_MASK_1_DS: tl.constexpr,
 ):
+    # tl.static_print(f"NEED_MASK_HD: {NEED_MASK_HD}")
+    # tl.static_print(f"NEED_MASK_CS_DS: {NEED_MASK_CS_DS}")
+    # tl.static_print(f"NEED_MASK_CS_CS_outer: {NEED_MASK_CS_CS_outer}")
+    # tl.static_print(f"NEED_MASK_CS_CS_inner: {NEED_MASK_CS_CS_inner}")
+    # tl.static_print(f"NEED_MASK_1_DS: {NEED_MASK_1_DS}")
     # some strides must be 64-bit to prevent int32 overflow
     # for now, only do the batch size for the largest things
     stride_x_batch = stride_x_batch.to(tl.int64)
@@ -308,8 +320,12 @@ def _fused5_ssd_kernel(
         # chunk state chunk_size loop
         acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
         for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
-            x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
-            b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
+            if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+            else:
+                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
             dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
             if HAS_SEQ_IDX:
                 seq_idx_k = tl.load(seq_idx_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=-1)
@@ -338,10 +354,7 @@ def _fused5_ssd_kernel(
         offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
         state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
 
-        main_mask = (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
-
-
-
+        main_mask = None if ((not NEED_MASK_HD) and (not NEED_MASK_1_DS)) else (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
 
         # offset gets us to the end of each chunk
         dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
@@ -359,14 +372,20 @@ def _fused5_ssd_kernel(
             sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
 
         # need to load states from previous one (but already offset by 1 so no offset)
-        states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+        if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+            states_prev = tl.load(state_G_ptrs)
+        else:
+            states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
 
         states_mod = scale * states_prev + states # NOTE: scale.to(tl.float16) seems to slow it down
         
         # ptrs
         state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
         
-        tl.store(state_G_ptrs, states_mod, mask=main_mask)
+        if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+            tl.store(state_G_ptrs, states_mod)
+        else:
+            tl.store(state_G_ptrs, states_mod, mask=main_mask)
         # let the next one go
         tl.atomic_add(sync_atomic, 1, sem='release')
 
@@ -392,8 +411,10 @@ def _fused5_ssd_kernel(
     for pid_cs in range(0, cs_num_pid_cs, 1): # pid_other, num_pid_cs, num_pid_ds*CS_BLOCK_HD_MULT):
         offs_cs = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
-        dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize, mask=offs_cs < chunk_size, other=0.0).to(tl.float32)
-
+        if not NEED_MASK_CS_CS_outer:
+            dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize).to(tl.float32)
+        else:
+            dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize, mask=offs_cs < chunk_size, other=0.0).to(tl.float32)
         chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
         if HAS_SEQ_IDX:
             seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
@@ -423,8 +444,12 @@ def _fused5_ssd_kernel(
                 acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(acc.dtype)
             else:
                 for k in range(0, dstate, CS_BLOCK_SIZE_DS):
-                    C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
-                    prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_hd[None, :] < hdim), other=0.0)
+                    if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
+                        C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
+                        prev_states = tl.load(prev_states_ptrs)
+                    else:
+                        C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
+                        prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_hd[None, :] < hdim), other=0.0)
                     prev_states = prev_states.to(C_ptr.dtype.element_ty)
                     acc += tl.dot(C, prev_states, out_dtype=acc.dtype)
                     C_ptrs += CS_BLOCK_SIZE_DS
@@ -438,18 +463,27 @@ def _fused5_ssd_kernel(
         dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
         K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS, chunk_size_limit)
         for k in range(0, K_MAX, CS_BLOCK_SIZE_DS):
-            cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
-            dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
+            # NOTE: CB, dA, and dt (dt_out) are always allocated in chunks, it's always fine to read beyond seqlen within a chunk
+            if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):
+                cb = tl.load(cb_ptrs, eviction_policy='evict_last')
+                dA_cs_k = tl.load(dA_cumsum_ptrs).to(tl.float32)
+                dt_k = tl.load(dt_ptrs).to(acc.dtype)
+            else:
+                cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
+                dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
+                dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
             # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
             # So we don't need masking wrt seq_idx here.
             cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
-            dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
             cb *= dt_k
             if IS_CAUSAL:
                 mask = offs_cs[:, None] >= k + offs_k[None, :]
                 cb = tl.where(mask, cb, 0.0)
             cb = cb.to(x_ptr.dtype.element_ty)
-            x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
+            if not NEED_MASK_HD:
+                x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_last')
+            else:
+                x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
             acc += tl.dot(cb, x, out_dtype=acc.dtype)
             cb_ptrs += CS_BLOCK_SIZE_DS * stride_cb_csize_k
             x_ptrs += CS_BLOCK_SIZE_DS * stride_x_seqlen

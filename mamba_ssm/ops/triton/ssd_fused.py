@@ -16,7 +16,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
         triton.Config({ # A100 SXM4 80GB config
             'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
             'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 64,
-            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 2,
+            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 1,
             'CCS_BLOCK_SIZE_H': 16,
             }, num_stages=1, num_warps=4, maxnreg=128),
     ],

@@ -13,7 +13,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(
     configs=[
-        triton.Config({
+        triton.Config({ # A100 SXM4 80GB config
             'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
             'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 64,
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 2,
@@ -134,7 +134,8 @@ def _fused5_ssd_kernel(
 
 
     if USE_ATOMIC_PID:
-        pid_og = tl.atomic_add(grid_atomic, 1)
+        # order does not matter, just need previous threadblocks concurrently running or finished
+        pid_og = tl.atomic_add(grid_atomic, 1, sem='relaxed')
     else:
         pid_og = tl.program_id(0)
 
@@ -246,13 +247,6 @@ def _fused5_ssd_kernel(
     pid_b = (pid_fused3 // (nheads * nchunks)) % batch
     pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
 
-    # wait for this (batch, chunk)
-    first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
-    first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
-    # includes both, cumsum + bmm
-    while first2_wait_val < nheads + num_pid_n * BMM_BLOCK_SIZE_N * num_pid_m * BMM_BLOCK_SIZE_M * ngroups:
-        first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
-
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
     states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head + pid_c * stride_states_G_chunk
@@ -275,6 +269,13 @@ def _fused5_ssd_kernel(
 
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
+
+    # wait for this (batch, chunk)
+    first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
+    first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
+    # includes both, cumsum + bmm
+    while first2_wait_val < nheads + num_pid_n * BMM_BLOCK_SIZE_N * num_pid_m * BMM_BLOCK_SIZE_M * ngroups:
+        first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
 
     for pid_ds in range(0, num_pid_ds, 1):
         # chunk state offsets

@@ -22,6 +22,10 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
+@triton.heuristics(values={
+    'NEED_MASK_HD': lambda args: args['hdim'] / args['BLOCK_SIZE_HD'] != args['hdim'] // args['BLOCK_SIZE_HD'],
+    'NEED_MASK_CS_DS': lambda args: args['dstate'] / args['CS_BLOCK_SIZE_DS'] != args['dstate'] // args['CS_BLOCK_SIZE_DS'],
+})
 # NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
 def _fused5_ssd_kernel(
@@ -98,6 +102,9 @@ def _fused5_ssd_kernel(
     # NOTE: not an autotune thing
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
+    # heuristic bools
+    NEED_MASK_HD: tl.constexpr,
+    NEED_MASK_CS_DS: tl.constexpr,
 ):
     # some strides must be 64-bit to prevent int32 overflow
     # for now, only do the batch size for the largest things
@@ -406,8 +413,12 @@ def _fused5_ssd_kernel(
             else:
                 scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
             if BLOCK_SIZE_DSTATE <= 128:
-                C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
-                prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim), other=0.0)
+                if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
+                    C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
+                    prev_states = tl.load(prev_states_ptrs)
+                else:
+                    C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
+                    prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim), other=0.0)
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
                 acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(acc.dtype)
             else:

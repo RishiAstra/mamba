@@ -476,14 +476,13 @@ def _fused5_ssd_kernel(
             # So we don't need masking wrt seq_idx here.
             cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
             cb *= dt_k
-            if IS_CAUSAL:
-                mask = offs_cs[:, None] >= k + offs_k[None, :]
-                cb = tl.where(mask, cb, 0.0)
-            cb = cb.to(x_ptr.dtype.element_ty)
             if not NEED_MASK_HD:
                 x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_last')
             else:
                 x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
+            if IS_CAUSAL:
+                mask = offs_cs[:, None] >= k + offs_k[None, :]
+                cb = tl.where(mask, cb, 0.0)
             acc += tl.dot(cb, x, out_dtype=acc.dtype)
             cb_ptrs += CS_BLOCK_SIZE_DS * stride_cb_csize_k
             x_ptrs += CS_BLOCK_SIZE_DS * stride_x_seqlen

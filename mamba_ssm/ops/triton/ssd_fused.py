@@ -38,7 +38,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             'BMM_BLOCK_SIZE_M': BMM_BLOCK_SIZE_M, 'BMM_BLOCK_SIZE_N': BMM_BLOCK_SIZE_N, 'BMM_BLOCK_SIZE_K': BMM_BLOCK_SIZE_K,
             # cumsum config
             'CCS_BLOCK_SIZE_H': CCS_BLOCK_SIZE_H,
-            }, num_stages=2, num_warps=4, maxnreg=256) \
+            }, num_stages=num_stages, num_warps=num_warps, maxnreg=maxnreg) \
         
 # BLOCK_SIZE_HD: 64, BLOCK_SIZE_DS: 128, BLOCK_SIZE_CS: 128, CS_BLOCK_SIZE_CS_outer: 128,
 # CS_BLOCK_SIZE_CS_inner: 32,
@@ -48,7 +48,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
         for BLOCK_SIZE_HD in                [64] \
         for BLOCK_SIZE_DS in                [128] \
         for BLOCK_SIZE_CS in                [128] \
-        for CS_BLOCK_SIZE_CS_outer in       [128] \
+        for CS_BLOCK_SIZE_CS_outer in       [256] \
         for CS_BLOCK_SIZE_CS_inner in       [32] \
         for CS_BLOCK_SIZE_DS in             [64] \
         for CS_WHOLEBLOCK_DS in             [128] \
@@ -59,6 +59,24 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
         for num_stages in                   [2] \
         for num_warps in                    [4] \
         for maxnreg in                      [256] \
+
+        # CS_BLOCK_SIZE_CS_outer: 256, CS_BLOCK_SIZE_CS_inner: 32
+
+
+        # for BLOCK_SIZE_HD in                [32, 64] \
+        # for BLOCK_SIZE_DS in                [64, 128] \
+        # for BLOCK_SIZE_CS in                [128, 256] \
+        # for CS_BLOCK_SIZE_CS_outer in       [32, 64, 128, 256] \
+        # for CS_BLOCK_SIZE_CS_inner in       [32, 64, 128, 256] \
+        # for CS_BLOCK_SIZE_DS in             [32, 64, 128] \
+        # for CS_WHOLEBLOCK_DS in             [128] \
+        # for BMM_BLOCK_SIZE_M in             [32, 64, 128] \
+        # for BMM_BLOCK_SIZE_N in             [32, 64, 128] \
+        # for BMM_BLOCK_SIZE_K in             [32, 64, 128] \
+        # for CCS_BLOCK_SIZE_H in             [8, 16, 32] \
+        # for num_stages in                   [1, 2] \
+        # for num_warps in                    [4, 8] \
+        # for maxnreg in                      [64, 128, 256] \
 
         # for BLOCK_SIZE_HD in                [32, 64] \
         # for BLOCK_SIZE_DS in                [64, 128] \

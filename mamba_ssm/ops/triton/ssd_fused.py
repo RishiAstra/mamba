@@ -14,11 +14,18 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 @triton.autotune(
     configs=[
         triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
-            'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
-            'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 64,
-            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 1,
+            # head dim block for chunk state, state passing, and chunk scan
+            'BLOCK_SIZE_HD': 64,
+            # dstate and chunk_size blocks for chunk state and state passing
+            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 128,
+            # chunk scan config
+            'CS_BLOCK_SIZE_CS_outer': 128, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
+            # BMM config
+            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
+            # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
-            }, num_stages=1, num_warps=4, maxnreg=128),
+            }, num_stages=2, num_warps=4, maxnreg=256),
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
@@ -26,22 +33,18 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
     'NEED_MASK_HD': lambda args: args['hdim'] / args['BLOCK_SIZE_HD'] != args['hdim'] // args['BLOCK_SIZE_HD'],
     'NEED_MASK_CS_DS': lambda args: args['dstate'] / args['CS_BLOCK_SIZE_DS'] != args['dstate'] // args['CS_BLOCK_SIZE_DS'] or args['dstate'] != args['BLOCK_SIZE_DSTATE'],
     # TODO: fix confusion and CS_BLOCK_SIZE_DS also being used for chunk size
-    'NEED_MASK_CS_CS_inner': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_DS'] != args['chunk_size'] // args['CS_BLOCK_SIZE_DS'],
-    'NEED_MASK_CS_CS_outer': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS'],
+    'NEED_MASK_CS_CS_inner': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS_inner'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS_inner'],
+    'NEED_MASK_CS_CS_outer': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS_outer'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS_outer'],
     'NEED_MASK_1_DS': lambda args: args['dstate'] / args['BLOCK_SIZE_DS'] != args['dstate'] // args['BLOCK_SIZE_DS'],
 })
-# NOTE: this kernel assumes that a warp resident in an SM (already executed some instructions) is not permanently starved if other warps are spamming atomic instructions
 @triton.jit
 def _fused5_ssd_kernel(
-    first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk,
-    grid_atomic, USE_ATOMIC_PID: tl.constexpr,
-    sync_atomic, stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
-
+    first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk, grid_atomic, USE_ATOMIC_PID: tl.constexpr, sync_atomic,
+    stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
     # Matrix dimensions
-    hdim, dstate, chunk_size,
-    batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
+    hdim, dstate, chunk_size, batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
     ########################################
-    # Originally Chunk State
+    # Chunk State
     ########################################
     # Pointers to matrices
     x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
@@ -51,17 +54,15 @@ def _fused5_ssd_kernel(
     stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
     stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
-    
     ########################################
-    # Originally State Passing
+    # State Passing
     ########################################
     # Pointers to matrices
     states_G_ptr,
     # Strides
     stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
-
     ########################################
-    # Originally Chunk Scan
+    # Chunk Scan
     ########################################
     # Pointers to matrices
     cb_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr,
@@ -71,48 +72,40 @@ def _fused5_ssd_kernel(
     stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
     stride_C_batch, stride_C_seqlen, stride_C_head, stride_C_dstate,
     stride_D_head,
-
-
     ########################################
-    # Originally Chunk Cumsum
+    # Chunk Cumsum
     ########################################
     # Pointers to matrices
     A_ptr, dt_bias_ptr, dt_orig_ptr,
-    # Matrix dimension
+    # dt limits
     dt_min, dt_max,
     # Strides
     stride_dt_orig_batch, stride_dt_orig_seqlen, stride_dt_orig_head,
     stride_A_head,
     stride_dt_bias_head,
-
-
     # Meta-parameters
-    IS_CAUSAL: tl.constexpr,
-    HAS_D: tl.constexpr,
-    D_HAS_HDIM: tl.constexpr,
-    HAS_Z: tl.constexpr,
-    HAS_SEQ_IDX: tl.constexpr,
-    IS_TRITON_22: tl.constexpr,
-    DT_SOFTPLUS: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
+    IS_CAUSAL: tl.constexpr, HAS_D: tl.constexpr, D_HAS_HDIM: tl.constexpr, HAS_Z: tl.constexpr,
+    HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr,
     # Block sizes
-    BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, CS_BLOCK_SIZE_CS: tl.constexpr,
-    CS_BLOCK_SIZE_DS: tl.constexpr,
-    BMM_BLOCK_SIZE_M: tl.constexpr,
-    BMM_BLOCK_SIZE_N: tl.constexpr,
-    BMM_BLOCK_SIZE_K: tl.constexpr,
-    BMM_STAGES: tl.constexpr,
-    CCS_BLOCK_SIZE_H: tl.constexpr, 
+    BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, 
+    CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
+    BMM_BLOCK_SIZE_M: tl.constexpr, BMM_BLOCK_SIZE_N: tl.constexpr, BMM_BLOCK_SIZE_K: tl.constexpr,
+    CCS_BLOCK_SIZE_H: tl.constexpr,
     # NOTE: not an autotune thing
-    BLOCK_SIZE_DSTATE: tl.constexpr,
-    BLOCK_SIZE_CHUNK: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
     # heuristic bools
-    NEED_MASK_HD: tl.constexpr,
-    NEED_MASK_CS_DS: tl.constexpr,
-    NEED_MASK_CS_CS_outer: tl.constexpr,
-    NEED_MASK_CS_CS_inner: tl.constexpr,
-    NEED_MASK_1_DS: tl.constexpr,
+    NEED_MASK_HD: tl.constexpr, NEED_MASK_CS_DS: tl.constexpr, NEED_MASK_CS_CS_outer: tl.constexpr, NEED_MASK_CS_CS_inner: tl.constexpr, NEED_MASK_1_DS: tl.constexpr,
 ):
+    """
+    This fused Mamba2 SSD kernel combines the 5 original SSD kernels.
+    There are two important things to keep in mind when using it:
+    * This kernel assumes that a warp resident in an SM (already executed some instructions)
+    is not permanently starved if other warps are spamming atomic instructions.
+    I think this is true for Volta+ (V100 and later).
+    * This kernel is extremely sensitive to register pressure. Any modifications should be done carefully.
+    The config is extremely sensitive.
+    * The config and / or kernel may need slight changes to be optimal for other models, currently tuned on Mamba2-2.7B.
+    """
     # tl.static_print(f"NEED_MASK_HD: {NEED_MASK_HD}")
     # tl.static_print(f"NEED_MASK_CS_DS: {NEED_MASK_CS_DS}")
     # tl.static_print(f"NEED_MASK_CS_CS_outer: {NEED_MASK_CS_CS_outer}")
@@ -230,8 +223,7 @@ def _fused5_ssd_kernel(
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
             acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=cb_ptr.dtype.element_ty)
-            # for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
-            for k in tl.range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K), num_stages=BMM_STAGES):
+            for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
                 a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0)
                 b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0)
                 acc += tl.dot(a, b, out_dtype=acc.dtype)
@@ -400,7 +392,7 @@ def _fused5_ssd_kernel(
     # pids same for all 3 parts
     # all pids represent domain parallelism except pid_c for state passing
     # cs_num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
-    cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS)
+    cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS_outer)
 
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
@@ -408,8 +400,8 @@ def _fused5_ssd_kernel(
         out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
         z_ptr += pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
 
-    for pid_cs in range(0, cs_num_pid_cs, 1): # pid_other, num_pid_cs, num_pid_ds*CS_BLOCK_HD_MULT):
-        offs_cs = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
+    for pid_cs in range(0, cs_num_pid_cs, 1):
+        offs_cs = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
         offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
         if not NEED_MASK_CS_CS_outer:
             dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize).to(tl.float32)
@@ -419,21 +411,21 @@ def _fused5_ssd_kernel(
         if HAS_SEQ_IDX:
             seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
             seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
-        acc = tl.zeros((CS_BLOCK_SIZE_CS, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty)
+        acc = tl.zeros((CS_BLOCK_SIZE_CS_outer, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty)
 
         # Without the if (pid_c > -1), with Triton 2.1.0, I get
         # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
         # With Triton 2.2.0, this works
         if IS_TRITON_22 or pid_c > -1:
-            # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
-            offs_k_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else CS_BLOCK_SIZE_DS)
+            # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size CS_WHOLEBLOCK_DS
+            offs_k_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS else CS_BLOCK_SIZE_DS)
             C_ptrs = C_ptr + (offs_cs[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate)
             prev_states_ptrs = states_G_ptr + (offs_hd[None, :] * stride_states_G_hdim + offs_k_dstate[:, None] * stride_states_G_dstate)
             if not HAS_SEQ_IDX:
                 scale_m = tl.exp(dA_cs_m)
             else:
                 scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
-            if BLOCK_SIZE_DSTATE <= 128:
+            if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
                 if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
                     C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
                     prev_states = tl.load(prev_states_ptrs)
@@ -456,13 +448,13 @@ def _fused5_ssd_kernel(
                     prev_states_ptrs += CS_BLOCK_SIZE_DS
                 acc *= (scale_m[:, None]).to(acc.dtype)
 
-        offs_k = tl.arange(0, CS_BLOCK_SIZE_DS)
+        offs_k = tl.arange(0, CS_BLOCK_SIZE_CS_inner)
         cb_ptrs = cb_ptr + (offs_cs[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
         x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim)
         dt_ptrs = dt_ptr + offs_k * stride_dt_csize
         dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
-        K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS, chunk_size_limit)
-        for k in range(0, K_MAX, CS_BLOCK_SIZE_DS):
+        K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS_inner, chunk_size_limit)
+        for k in range(0, K_MAX, CS_BLOCK_SIZE_CS_inner):
             # NOTE: CB, dA, and dt (dt_out) are always allocated in chunks, it's always fine to read beyond seqlen within a chunk
             if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):
                 cb = tl.load(cb_ptrs, eviction_policy='evict_last')
@@ -484,12 +476,12 @@ def _fused5_ssd_kernel(
                 mask = offs_cs[:, None] >= k + offs_k[None, :]
                 cb = tl.where(mask, cb, 0.0)
             acc += tl.dot(cb, x, out_dtype=acc.dtype)
-            cb_ptrs += CS_BLOCK_SIZE_DS * stride_cb_csize_k
-            x_ptrs += CS_BLOCK_SIZE_DS * stride_x_seqlen
-            dt_ptrs += CS_BLOCK_SIZE_DS * stride_dt_csize
-            dA_cumsum_ptrs += CS_BLOCK_SIZE_DS * stride_dA_cs_csize
+            cb_ptrs += CS_BLOCK_SIZE_CS_inner * stride_cb_csize_k
+            x_ptrs += CS_BLOCK_SIZE_CS_inner * stride_x_seqlen
+            dt_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dt_csize
+            dA_cumsum_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dA_cs_csize
 
-        offs_out_m = pid_cs * CS_BLOCK_SIZE_CS + tl.arange(0, CS_BLOCK_SIZE_CS)
+        offs_out_m = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
         offs_out_n = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
 
         if HAS_D:

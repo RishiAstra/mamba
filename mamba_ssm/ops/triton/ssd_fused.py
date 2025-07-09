@@ -13,19 +13,67 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(
     configs=[
+        # triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
+        #     # head dim block for chunk state, state passing, and chunk scan
+        #     'BLOCK_SIZE_HD': 64,
+        #     # dstate and chunk_size blocks for chunk state and state passing
+        #     'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 128,
+        #     # chunk scan config
+        #     'CS_BLOCK_SIZE_CS_outer': 128, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
+        #     'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
+        #     # BMM config
+        #     'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
+        #     # cumsum config
+        #     'CCS_BLOCK_SIZE_H': 16,
+        #     }, num_stages=2, num_warps=4, maxnreg=256),
         triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
             # head dim block for chunk state, state passing, and chunk scan
-            'BLOCK_SIZE_HD': 64,
+            'BLOCK_SIZE_HD': BLOCK_SIZE_HD,
             # dstate and chunk_size blocks for chunk state and state passing
-            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 128,
+            'BLOCK_SIZE_DS': BLOCK_SIZE_DS, 'BLOCK_SIZE_CS': BLOCK_SIZE_CS,
             # chunk scan config
-            'CS_BLOCK_SIZE_CS_outer': 128, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
-            'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
+            'CS_BLOCK_SIZE_CS_outer': CS_BLOCK_SIZE_CS_outer, 'CS_BLOCK_SIZE_CS_inner': CS_BLOCK_SIZE_CS_inner, 'CS_BLOCK_SIZE_DS': CS_BLOCK_SIZE_DS,
+            'CS_WHOLEBLOCK_DS': CS_WHOLEBLOCK_DS, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
             # BMM config
-            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
+            'BMM_BLOCK_SIZE_M': BMM_BLOCK_SIZE_M, 'BMM_BLOCK_SIZE_N': BMM_BLOCK_SIZE_N, 'BMM_BLOCK_SIZE_K': BMM_BLOCK_SIZE_K,
             # cumsum config
-            'CCS_BLOCK_SIZE_H': 16,
-            }, num_stages=2, num_warps=4, maxnreg=256),
+            'CCS_BLOCK_SIZE_H': CCS_BLOCK_SIZE_H,
+            }, num_stages=2, num_warps=4, maxnreg=256) \
+        
+# BLOCK_SIZE_HD: 64, BLOCK_SIZE_DS: 128, BLOCK_SIZE_CS: 128, CS_BLOCK_SIZE_CS_outer: 128,
+# CS_BLOCK_SIZE_CS_inner: 32,
+# CS_BLOCK_SIZE_DS: 64, CS_WHOLEBLOCK_DS: 128, BMM_BLOCK_SIZE_M: 64, BMM_BLOCK_SIZE_N: 64, BMM_BLOCK_SIZE_K: 64, CCS_BLOCK_SIZE_H: 16, num_warps: 4, num_ctas: 1, num_stages: 2, num_buffers_warp_spec: 0, num_consumer_groups: 0, reg_dec_producer: 0, reg_inc_consumer: 0, maxnreg: 256;
+
+
+        for BLOCK_SIZE_HD in                [64] \
+        for BLOCK_SIZE_DS in                [128] \
+        for BLOCK_SIZE_CS in                [128] \
+        for CS_BLOCK_SIZE_CS_outer in       [128] \
+        for CS_BLOCK_SIZE_CS_inner in       [32] \
+        for CS_BLOCK_SIZE_DS in             [64] \
+        for CS_WHOLEBLOCK_DS in             [128] \
+        for BMM_BLOCK_SIZE_M in             [64] \
+        for BMM_BLOCK_SIZE_N in             [64] \
+        for BMM_BLOCK_SIZE_K in             [64] \
+        for CCS_BLOCK_SIZE_H in             [16] \
+        for num_stages in                   [2] \
+        for num_warps in                    [4] \
+        for maxnreg in                      [256] \
+
+        # for BLOCK_SIZE_HD in                [32, 64] \
+        # for BLOCK_SIZE_DS in                [64, 128] \
+        # for BLOCK_SIZE_CS in                [32, 64, 128, 256] \
+        # for CS_BLOCK_SIZE_CS_outer in       [32, 64, 128] \
+        # for CS_BLOCK_SIZE_CS_inner in       [32, 64, 128] \
+        # for CS_BLOCK_SIZE_DS in             [32, 64, 128] \
+        # for CS_WHOLEBLOCK_DS in             [128] \
+        # for BMM_BLOCK_SIZE_M in             [32, 64, 128] \
+        # for BMM_BLOCK_SIZE_N in             [32, 64, 128] \
+        # for BMM_BLOCK_SIZE_K in             [32, 64, 128] \
+        # for CCS_BLOCK_SIZE_H in             [8, 16, 32] \
+        # for num_stages in                   [1, 2, 3, 4] \
+        # for num_warps in                    [2, 4, 8] \
+        # for maxnreg in                      [64, 128, 256] \
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )

@@ -13,7 +13,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(
     configs=[
-        triton.Config({ # A100 SXM4 80GB config
+        triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
             'BLOCK_SIZE_HD': 64, 'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
             'CS_BLOCK_SIZE_CS': 64, 'CS_BLOCK_SIZE_DS': 64,
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64, 'BMM_STAGES': 1,

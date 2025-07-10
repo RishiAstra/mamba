@@ -16,15 +16,15 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # head dim block for chunk state, state passing, and chunk scan
             'BLOCK_SIZE_HD': 64,
             # dstate and chunk_size blocks for chunk state and state passing
-            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 128,
+            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
             # chunk scan config
-            'CS_BLOCK_SIZE_CS_outer': 256, 'CS_BLOCK_SIZE_CS_inner': 32, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
             'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
             # BMM config
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
-            }, num_stages=2, num_warps=4, maxnreg=256),
+            }, num_stages=1, num_warps=4, maxnreg=128),
         # Use this for autotuning, it makes hundreds of configs though
         # You can also try other block size values not in the lists below
         # It's probably best to autotune the BMM and CCS block sizes separate from the other block sizes,
@@ -36,18 +36,16 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
         #     'CCS_BLOCK_SIZE_H': CCS_BLOCK_SIZE_H, }, num_stages=num_stages, num_warps=num_warps, maxnreg=maxnreg) \
         #     for BLOCK_SIZE_HD in            [64] \
         #     for BLOCK_SIZE_DS in            [128] \
-        #     for BLOCK_SIZE_CS in            [128, 256] \
+        #     for BLOCK_SIZE_CS in            [64, 128, 256] \
         #     for CS_BLOCK_SIZE_CS_outer in   [32, 64, 128, 256] \
         #     for CS_BLOCK_SIZE_CS_inner in   [32, 64, 128, 256] \
-        #     for CS_BLOCK_SIZE_DS in         [32, 64, 128] \
+        #     for CS_BLOCK_SIZE_DS in         [128] \
         #     for CS_WHOLEBLOCK_DS in         [128] \
         #     for BMM_BLOCK_SIZE_M in         [64] \
         #     for BMM_BLOCK_SIZE_N in         [64] \
         #     for BMM_BLOCK_SIZE_K in         [64] \
         #     for CCS_BLOCK_SIZE_H in         [16] \
-        #     for num_stages in               [1, 2] \
-        #     for num_warps in                [4, 8] \
-        #     for maxnreg in                  [128, 256] \
+        #     for num_stages, num_warps, maxnreg in [(1, 4, 128), (2, 4, 256), (2, 8, 256)]
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
@@ -440,7 +438,7 @@ def _fused5_ssd_kernel(
         x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim)
         dt_ptrs = dt_ptr + offs_k * stride_dt_csize
         dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
-        K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS_inner, chunk_size_limit)
+        K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS_outer, chunk_size_limit)
         for k in range(0, K_MAX, CS_BLOCK_SIZE_CS_inner):
             # NOTE: CB, dA, and dt (dt_out) are always allocated in chunks, it's always fine to read beyond seqlen within a chunk
             if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):

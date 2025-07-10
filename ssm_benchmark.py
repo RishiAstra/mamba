@@ -1,36 +1,32 @@
 # some code from https://triton-lang.org/main/getting-started/tutorials/...
 
-# TODO: check correctness for out, out_x, dt, dA_cumsum, states, final_states, not just out
+CHECK_CORRECTNESS = False
+USE_GIVEN_TEST_TENSORS = True # real prompt data, loads from files
+if not CHECK_CORRECTNESS:
+    USE_GIVEN_TEST_TENSORS = False
+
 BENCHMARK_REPEATS = 25
-
-
 
 have_init_states    = False
 have_seq_idx        = False
 have_cu_seqlens     = False # TODO: test
-have_dt_softplus    = False # TODO: test
+have_dt_softplus    = True # TODO: test more
 
-USE_GIVEN_TEST_TENSORS = False
-atol_rand = 5e-2
-atol_given = 5e-4
 
 import random
 import torch
 
 import triton
-import triton.language as tl
 import numpy as np
 
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, fused=False)
-    return outputs[0]
-    # return out, out_x, dt, dA_cumsum, states, final_states
+    return outputs
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, fused=True)
-    return outputs[0]
-    # return out, out_x, dt, dA_cumsum, states, final_states
+    return outputs
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
@@ -52,7 +48,7 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1) #9 for batch=1, 7 for 8, 6 for 32?
+    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1) #9 for batch=1, 6 for 8, 4 for 32 so that original doesn't fail
     # (get_test_size(1024 * 2 ** i),) for i in [7] # for quick test
     # (get_test_size(2753))
 ]
@@ -72,35 +68,29 @@ configs.append(
     )
 )
 
+# used to load actual tensors from files
+counter = 64 # skip warmup tensors, but warmup tensors should be the same anyway
 def get_rand_input(dims_b_seq_nh_hd_ng_ds):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
     torch.manual_seed(0)
 
-    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.8
+    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.2 + 0.5
     dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE) * 0.5 - 5
-    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 2 - 10
+    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 3 - 10
     B = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 3 + 7
     C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 5 + 20
     D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.5 + 1.2
     x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 2 + 5
 
+    # NOTE: overrides the sizes
     if USE_GIVEN_TEST_TENSORS:
-        dt_in = torch.load("dump/dt_in.txt")
-        dt_bias_in = torch.load("dump/dt_bias_in.txt")
-        A_in = torch.load("dump/A_in.txt")
-        B_in = torch.load("dump/B_in.txt")
-        C_in = torch.load("dump/C_in.txt")
-        D_in = torch.load("dump/D_in.txt")
-        x_in = torch.load("dump/x_in.txt")
-        # assign
-        seq_min = min(seqlen, B_in.shape[1])
-        dt[:, :seq_min] = dt_in[:, :seq_min]
-        dt_bias = dt_bias_in
-        A = A_in
-        B[:, :seq_min] = B_in[:, :seq_min]
-        C[:, :seq_min] = C_in[:, :seq_min]
-        D = D_in
-        x[:, :seq_min] = x_in[:, :seq_min]
+        A =         torch.load(f"dump/A_in{counter}")
+        B =         torch.load(f"dump/B_in{counter}")
+        C =         torch.load(f"dump/C_in{counter}")
+        D =         torch.load(f"dump/D_in{counter}")
+        dt_bias =   torch.load(f"dump/dt_bias_in{counter}")
+        dt =        torch.load(f"dump/dt_in{counter}")
+        x =         torch.load(f"dump/x_in{counter}")
 
     if have_init_states:
         initial_states = torch.randn((batch, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
@@ -135,37 +125,48 @@ def run_unit_test(seqlen):
     dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen))
     CHUNK_SIZE=256
 
-    outputs = [thing[0](
+    outputs_full = [thing[0](
             x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
             ) for thing in things_to_compare]
-    for i in range(len(outputs)):
-        print(f"output for {things_to_compare[i][1]} = {outputs[i]}")
-    PRINT_BAD_TENSOR = False
-    bad_i = -1
-    # compare all to the first
-    for i in range(1, len(outputs), 1):
-        atol = atol_given if USE_GIVEN_TEST_TENSORS else atol_rand
-        rtol = 1e-2
-        if torch.allclose(outputs[i], outputs[0], atol=atol, rtol=rtol, equal_nan=True):
-            print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")
-        else:
-            print(f"❌ {things_to_compare[i][1]} and {things_to_compare[0][1]} differ")
-            bad_i = i
-        max_diff_idx = torch.argmax(torch.abs(outputs[i] - outputs[0]))
-        max_diff = torch.abs(outputs[i].reshape(-1)[max_diff_idx] - outputs[0].reshape(-1)[max_diff_idx])
-        print(f"max diff: {max_diff} for {max_diff_idx} index, a: {outputs[i].reshape(-1)[max_diff_idx]}, b: {outputs[0].reshape(-1)[max_diff_idx]}")
-        max_rdiff_idx = torch.argmax(torch.abs((outputs[i] - outputs[0]) / outputs[0]))
-        max_rdiff = torch.abs((outputs[i].reshape(-1)[max_rdiff_idx] - outputs[0].reshape(-1)[max_rdiff_idx] / outputs[0].reshape(-1)[max_rdiff_idx]))
-        print(f"max rel diff: {max_rdiff} for {max_rdiff_idx} index, a: {outputs[i].reshape(-1)[max_rdiff_idx]}, b: {outputs[0].reshape(-1)[max_rdiff_idx]}")
-        fail_bools = torch.abs(outputs[i] - outputs[0]) > atol + rtol * torch.abs(outputs[0])
-        fail_bool_num = fail_bools.sum().cpu().item()
-        total_elems = outputs[0].numel()
-        print(f"failed elements / total: {fail_bool_num} / {total_elems}, {fail_bool_num / total_elems * 100.0}%")
+    field_names = ["out", "out_x", "dt", "dA_cumsum", "states", "final_states"]
+    for field_idx in range(len(outputs_full[0])):
+        outputs_0 = outputs_full[0][field_idx]
+        if outputs_0 is None: # skip None
+            continue
+        print(f"comparing field {field_names[field_idx]}")
+        # for i in range(len(outputs_full)):
+        #     outputs_i = outputs_full[i][field_idx]
+        #     print(f"output for {things_to_compare[i][1]} = {outputs_i}")
+        PRINT_BAD_TENSOR = False
+        bad_i = -1
+        # compare all to the first
+        for i in range(1, len(outputs_full), 1):
+            outputs_i = outputs_full[i][field_idx]
+            atol = 2.5e-3
+            rtol = 1e-2
+            outputs_i = outputs_i.to(outputs_0.dtype)
+            if torch.allclose(outputs_i, outputs_0, atol=atol, rtol=rtol, equal_nan=True):
+                print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")
+            else:
+                print(f"❌ {things_to_compare[i][1]} and {things_to_compare[0][1]} differ")
+                bad_i = i
+            max_diff_idx = torch.argmax(torch.abs(outputs_i - outputs_0))
+            max_diff = torch.abs(outputs_i.reshape(-1)[max_diff_idx] - outputs_0.reshape(-1)[max_diff_idx])
+            print(f"max diff: {max_diff} for {max_diff_idx} index, a: {outputs_i.reshape(-1)[max_diff_idx]}, b: {outputs_0.reshape(-1)[max_diff_idx]}")
+            max_allowed_diff = atol + rtol * torch.abs(outputs_0)
+            max_diff_frac = torch.abs(outputs_i - outputs_0) / max_allowed_diff
+            max_rdiff_idx = torch.argmax(max_diff_frac)
+            max_rdiff = max_diff_frac.reshape(-1)[max_rdiff_idx]
+            print(f"max diff score: {max_rdiff} for {max_rdiff_idx} index, a: {outputs_i.reshape(-1)[max_rdiff_idx]}, b: {outputs_0.reshape(-1)[max_rdiff_idx]}")
+            fail_bools = torch.abs(outputs_i - outputs_0) > atol + rtol * torch.abs(outputs_0)
+            fail_bool_num = fail_bools.sum().cpu().item()
+            total_elems = outputs_0.numel()
+            print(f"failed elements / total: {fail_bool_num} / {total_elems}, {fail_bool_num / total_elems * 100.0}%")
 
 
-    if bad_i >= 0 and PRINT_BAD_TENSOR:
-        np.savetxt('bad_output.txt', outputs[bad_i].cpu().numpy(), fmt="%.2e")
+        if bad_i >= 0 and PRINT_BAD_TENSOR:
+            np.savetxt(f'bad_output_{field_idx}.txt', outputs_full[bad_i][field_idx].cpu().numpy(), fmt="%.2e")
 
 
 @triton.testing.perf_report(configs)
@@ -187,10 +188,14 @@ def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
 
 if __name__ == "__main__":
     # use to check correctness
-    # run_unit_test(1024)
-    # run_unit_test(4096)
-    run_unit_test(2763)
-    # run_unit_test(1783)
-    # use to benchmark
-    # benchmark.run(show_plots=True, print_data=True)
+    if CHECK_CORRECTNESS:
+        if USE_GIVEN_TEST_TENSORS:
+            for i in range(64):
+                print(f"******* counter {counter} ******")
+                run_unit_test(1)
+                counter += 1
+        else:
+            run_unit_test(2763)
+    else:
+        benchmark.run(show_plots=True, print_data=True)
 

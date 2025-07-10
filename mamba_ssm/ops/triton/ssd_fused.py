@@ -354,10 +354,11 @@ def _fused5_ssd_kernel(
     while first2_wait_val < nheads + num_pid_n * BMM_BLOCK_SIZE_N * num_pid_m * BMM_BLOCK_SIZE_M * ngroups:
         first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
 
+    offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
+
     for pid_ds in range(0, num_pid_ds, 1):
         # chunk state offsets
         # NOTE: m ->hdim, n -> dstate, k -> chunk_size
-        offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
         offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
         offs_cs = tl.arange(0, BLOCK_SIZE_CS)
 
@@ -407,9 +408,6 @@ def _fused5_ssd_kernel(
     ########################################
     # State Passing
     ########################################
-
-        offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
-        offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
         state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
 
         main_mask = None if ((not NEED_MASK_HD) and (not NEED_MASK_1_DS)) else (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
@@ -468,7 +466,6 @@ def _fused5_ssd_kernel(
 
     for pid_cs in range(0, cs_num_pid_cs, 1):
         offs_cs = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
-        offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
         if not NEED_MASK_CS_CS_outer:
             dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize).to(tl.float32)
         else:
@@ -547,28 +544,29 @@ def _fused5_ssd_kernel(
             dt_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dt_csize
             dA_cumsum_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dA_cs_csize
 
-        offs_out_m = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
-        offs_out_n = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
-
         if HAS_D:
             if D_HAS_HDIM:
                 D = tl.load(D_ptr + pid_h * stride_D_head + offs_hd, mask=offs_hd < hdim, other=0.0)
             else:
                 D = tl.load(D_ptr + pid_h * stride_D_head)
-            x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
-                                mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0)
+            if not NEED_MASK_HD:
+                x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
+                                    mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
+            else:
+                x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
+                                    mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0)
             acc += x_residual * D
 
         if HAS_Z:
-            out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :])
-            tl.store(out_x_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim))
+            out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :])
+            tl.store(out_x_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim))
 
-            z_ptrs = z_ptr + (stride_z_seqlen * offs_out_m[:, None] + stride_z_hdim * offs_out_n[None, :])
-            z = tl.load(z_ptrs, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim), other=0.0).to(tl.float32)
+            z_ptrs = z_ptr + (stride_z_seqlen * offs_cs[:, None] + stride_z_hdim * offs_hd[None, :])
+            z = tl.load(z_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0).to(tl.float32)
             acc *= z * tl.sigmoid(z)
 
-        out_ptrs = out_ptr + (stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim)
-        tl.store(out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim), eviction_policy='evict_first')
+        out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
+        tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_first')
 
 
 def _fused5_ssd(

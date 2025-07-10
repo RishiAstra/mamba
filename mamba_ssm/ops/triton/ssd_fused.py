@@ -1,7 +1,6 @@
 # The fused-5 ssd kernel
 
 import math
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -13,98 +12,52 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(
     configs=[
-        # triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
-        #     # head dim block for chunk state, state passing, and chunk scan
-        #     'BLOCK_SIZE_HD': 64,
-        #     # dstate and chunk_size blocks for chunk state and state passing
-        #     'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 128,
-        #     # chunk scan config
-        #     'CS_BLOCK_SIZE_CS_outer': 128, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
-        #     'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
-        #     # BMM config
-        #     'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
-        #     # cumsum config
-        #     'CCS_BLOCK_SIZE_H': 16,
-        #     }, num_stages=2, num_warps=4, maxnreg=256),
         triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
             # head dim block for chunk state, state passing, and chunk scan
-            'BLOCK_SIZE_HD': BLOCK_SIZE_HD,
+            'BLOCK_SIZE_HD': 64,
             # dstate and chunk_size blocks for chunk state and state passing
-            'BLOCK_SIZE_DS': BLOCK_SIZE_DS, 'BLOCK_SIZE_CS': BLOCK_SIZE_CS,
+            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 128,
             # chunk scan config
-            'CS_BLOCK_SIZE_CS_outer': CS_BLOCK_SIZE_CS_outer, 'CS_BLOCK_SIZE_CS_inner': CS_BLOCK_SIZE_CS_inner, 'CS_BLOCK_SIZE_DS': CS_BLOCK_SIZE_DS,
-            'CS_WHOLEBLOCK_DS': CS_WHOLEBLOCK_DS, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
+            'CS_BLOCK_SIZE_CS_outer': 256, 'CS_BLOCK_SIZE_CS_inner': 32, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
             # BMM config
-            'BMM_BLOCK_SIZE_M': BMM_BLOCK_SIZE_M, 'BMM_BLOCK_SIZE_N': BMM_BLOCK_SIZE_N, 'BMM_BLOCK_SIZE_K': BMM_BLOCK_SIZE_K,
+            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
             # cumsum config
-            'CCS_BLOCK_SIZE_H': CCS_BLOCK_SIZE_H,
-            }, num_stages=num_stages, num_warps=num_warps, maxnreg=maxnreg) \
-        
-# BLOCK_SIZE_HD: 64, BLOCK_SIZE_DS: 128, BLOCK_SIZE_CS: 128, CS_BLOCK_SIZE_CS_outer: 128,
-# CS_BLOCK_SIZE_CS_inner: 32,
-# CS_BLOCK_SIZE_DS: 64, CS_WHOLEBLOCK_DS: 128, BMM_BLOCK_SIZE_M: 64, BMM_BLOCK_SIZE_N: 64, BMM_BLOCK_SIZE_K: 64, CCS_BLOCK_SIZE_H: 16, num_warps: 4, num_ctas: 1, num_stages: 2, num_buffers_warp_spec: 0, num_consumer_groups: 0, reg_dec_producer: 0, reg_inc_consumer: 0, maxnreg: 256;
-
-
-        for BLOCK_SIZE_HD in                [64] \
-        for BLOCK_SIZE_DS in                [128] \
-        for BLOCK_SIZE_CS in                [128] \
-        for CS_BLOCK_SIZE_CS_outer in       [256] \
-        for CS_BLOCK_SIZE_CS_inner in       [32] \
-        for CS_BLOCK_SIZE_DS in             [64] \
-        for CS_WHOLEBLOCK_DS in             [128] \
-        for BMM_BLOCK_SIZE_M in             [64] \
-        for BMM_BLOCK_SIZE_N in             [64] \
-        for BMM_BLOCK_SIZE_K in             [64] \
-        for CCS_BLOCK_SIZE_H in             [16] \
-        for num_stages in                   [2] \
-        for num_warps in                    [4] \
-        for maxnreg in                      [256] \
-
-        # CS_BLOCK_SIZE_CS_outer: 256, CS_BLOCK_SIZE_CS_inner: 32
-
-
-        # for BLOCK_SIZE_HD in                [32, 64] \
-        # for BLOCK_SIZE_DS in                [64, 128] \
-        # for BLOCK_SIZE_CS in                [128, 256] \
-        # for CS_BLOCK_SIZE_CS_outer in       [32, 64, 128, 256] \
-        # for CS_BLOCK_SIZE_CS_inner in       [32, 64, 128, 256] \
-        # for CS_BLOCK_SIZE_DS in             [32, 64, 128] \
-        # for CS_WHOLEBLOCK_DS in             [128] \
-        # for BMM_BLOCK_SIZE_M in             [32, 64, 128] \
-        # for BMM_BLOCK_SIZE_N in             [32, 64, 128] \
-        # for BMM_BLOCK_SIZE_K in             [32, 64, 128] \
-        # for CCS_BLOCK_SIZE_H in             [8, 16, 32] \
-        # for num_stages in                   [1, 2] \
-        # for num_warps in                    [4, 8] \
-        # for maxnreg in                      [64, 128, 256] \
-
-        # for BLOCK_SIZE_HD in                [32, 64] \
-        # for BLOCK_SIZE_DS in                [64, 128] \
-        # for BLOCK_SIZE_CS in                [32, 64, 128, 256] \
-        # for CS_BLOCK_SIZE_CS_outer in       [32, 64, 128] \
-        # for CS_BLOCK_SIZE_CS_inner in       [32, 64, 128] \
-        # for CS_BLOCK_SIZE_DS in             [32, 64, 128] \
-        # for CS_WHOLEBLOCK_DS in             [128] \
-        # for BMM_BLOCK_SIZE_M in             [32, 64, 128] \
-        # for BMM_BLOCK_SIZE_N in             [32, 64, 128] \
-        # for BMM_BLOCK_SIZE_K in             [32, 64, 128] \
-        # for CCS_BLOCK_SIZE_H in             [8, 16, 32] \
-        # for num_stages in                   [1, 2, 3, 4] \
-        # for num_warps in                    [2, 4, 8] \
-        # for maxnreg in                      [64, 128, 256] \
+            'CCS_BLOCK_SIZE_H': 16,
+            }, num_stages=2, num_warps=4, maxnreg=256),
+        # # use this for autotuning, it makes hundreds of configs though
+        # triton.Config({ 'BLOCK_SIZE_HD': BLOCK_SIZE_HD, 'BLOCK_SIZE_DS': BLOCK_SIZE_DS, 'BLOCK_SIZE_CS': BLOCK_SIZE_CS,
+        #     'CS_BLOCK_SIZE_CS_outer': CS_BLOCK_SIZE_CS_outer, 'CS_BLOCK_SIZE_CS_inner': CS_BLOCK_SIZE_CS_inner, 'CS_BLOCK_SIZE_DS': CS_BLOCK_SIZE_DS,
+        #     'CS_WHOLEBLOCK_DS': CS_WHOLEBLOCK_DS,
+        #     'BMM_BLOCK_SIZE_M': BMM_BLOCK_SIZE_M, 'BMM_BLOCK_SIZE_N': BMM_BLOCK_SIZE_N, 'BMM_BLOCK_SIZE_K': BMM_BLOCK_SIZE_K,
+        #     'CCS_BLOCK_SIZE_H': CCS_BLOCK_SIZE_H, }, num_stages=num_stages, num_warps=num_warps, maxnreg=maxnreg) \
+        #     for BLOCK_SIZE_HD in            [32, 64] \
+        #     for BLOCK_SIZE_DS in            [64, 128] \
+        #     for BLOCK_SIZE_CS in            [128, 256] \
+        #     for CS_BLOCK_SIZE_CS_outer in   [32, 64, 128, 256] \
+        #     for CS_BLOCK_SIZE_CS_inner in   [32, 64, 128, 256] \
+        #     for CS_BLOCK_SIZE_DS in         [32, 64, 128] \
+        #     for CS_WHOLEBLOCK_DS in         [128] \
+        #     for BMM_BLOCK_SIZE_M in         [32, 64, 128] \
+        #     for BMM_BLOCK_SIZE_N in         [32, 64, 128] \
+        #     for BMM_BLOCK_SIZE_K in         [32, 64, 128] \
+        #     for CCS_BLOCK_SIZE_H in         [8, 16, 32] \
+        #     for num_stages in               [1, 2] \
+        #     for num_warps in                [4, 8] \
+        #     for maxnreg in                  [64, 128, 256] \
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
 @triton.heuristics(values={
     'NEED_MASK_HD': lambda args: args['hdim'] / args['BLOCK_SIZE_HD'] != args['hdim'] // args['BLOCK_SIZE_HD'],
     'NEED_MASK_CS_DS': lambda args: args['dstate'] / args['CS_BLOCK_SIZE_DS'] != args['dstate'] // args['CS_BLOCK_SIZE_DS'] or args['dstate'] != args['BLOCK_SIZE_DSTATE'],
-    # TODO: fix confusion and CS_BLOCK_SIZE_DS also being used for chunk size
     'NEED_MASK_CS_CS_inner': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS_inner'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS_inner'],
     'NEED_MASK_CS_CS_outer': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS_outer'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS_outer'],
     'NEED_MASK_1_DS': lambda args: args['dstate'] / args['BLOCK_SIZE_DS'] != args['dstate'] // args['BLOCK_SIZE_DS'],
 })
 @triton.jit
 def _fused5_ssd_kernel(
+    # Synchronization
     first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk, grid_atomic, USE_ATOMIC_PID: tl.constexpr, sync_atomic,
     stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
     # Matrix dimensions
@@ -157,20 +110,46 @@ def _fused5_ssd_kernel(
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
     BMM_BLOCK_SIZE_M: tl.constexpr, BMM_BLOCK_SIZE_N: tl.constexpr, BMM_BLOCK_SIZE_K: tl.constexpr,
     CCS_BLOCK_SIZE_H: tl.constexpr,
-    # NOTE: not an autotune thing
+    # pwr2 dim constexprs
     BLOCK_SIZE_DSTATE: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
-    # heuristic bools
+    # Heuristic mask bools
     NEED_MASK_HD: tl.constexpr, NEED_MASK_CS_DS: tl.constexpr, NEED_MASK_CS_CS_outer: tl.constexpr, NEED_MASK_CS_CS_inner: tl.constexpr, NEED_MASK_1_DS: tl.constexpr,
 ):
     """
     This fused Mamba2 SSD kernel combines the 5 original SSD kernels.
-    There are two important things to keep in mind when using it:
+    There are a few important things to keep in mind when using it:
     * This kernel assumes that a warp resident in an SM (already executed some instructions)
     is not permanently starved if other warps are spamming atomic instructions.
     I think this is true for Volta+ (V100 and later).
     * This kernel is extremely sensitive to register pressure. Any modifications should be done carefully.
-    The config is extremely sensitive.
+    The config is extremely sensitive, and exhaustive autotuning can generate hundreds of configs.
     * The config and / or kernel may need slight changes to be optimal for other models, currently tuned on Mamba2-2.7B.
+    * This kernel can handle larger batch * seqlen than the original kernels (which get either bad output or illegal memory accesses from int32 overflow).
+    * This kernel could have slightly different output due to a different order of operations and casting (fp16 intermediate results instead of fp32), though in a quick test it gets the exact same output.
+    * HAS_Z is not tested, and this kernel was only tested on an A100 and H100.
+    
+    :param first2_wait_ptr: The atomic sync tensor for waiting for bmm and cumsum to be ready
+    :param grid_atomic: The atomic counter to get pids from, making sure that previous pids are either concurrent or finished
+    :param USE_ATOMIC_PID: If False, we assume that the GPU driver will launch pids in increasing order
+    :param sync_atomic: The atomic sync tensor for waiting for state passing chunk local states to be ready
+    :param dt_ptr: the new dt tensor generated by cumsum, which is chunked
+    :param dA_cumsum_ptr: the dA_cumsum tensor generated by cumsum
+    :param states_G_ptr: the global states tensor, including initial states and final states
+    :param cb_ptr: space for CB
+    :param dt_orig_ptr: the input dt, which is not chunked
+    :param BLOCK_SIZE_HD: the head dim (hdim) block for chunk state, state passing, and chunk scan
+    :param BLOCK_SIZE_DS: the state dim (dstate) block for chunk state and state passing
+    :param BLOCK_SIZE_CS: the chunk size block for chunk state (matmul loop k)
+    :param CS_WHOLEBLOCK_DS: threshold above which we use CS_BLOCK_SIZE_DS instead of the full state dim (dstate)
+    :param CS_BLOCK_SIZE_DS: the state dim (dstate) block for chunk scan, ignored if dstate <= CS_WHOLEBLOCK_DS
+    :param CS_BLOCK_SIZE_CS_outer: the chunk size block for chunk scan along rows of CB
+    :param CS_BLOCK_SIZE_CS_inner: the chunk size block for chunk scan inner dim (CB columns, x rows)
+    :param BMM_BLOCK_SIZE_M: BMM M dim (chunk size along C)
+    :param BMM_BLOCK_SIZE_N: BMM N dim (chunk size along B)
+    :param BMM_BLOCK_SIZE_K: BMM K dim (dstate inner dim)
+    :param CCS_BLOCK_SIZE_H: the block along heads for cumsum
+    :param BLOCK_SIZE_DSTATE: the state dim (dstate) rounded up pwr2
+    :param BLOCK_SIZE_CHUNK: the chunk size rounded up pwr2
     """
     # tl.static_print(f"NEED_MASK_HD: {NEED_MASK_HD}")
     # tl.static_print(f"NEED_MASK_CS_DS: {NEED_MASK_CS_DS}")

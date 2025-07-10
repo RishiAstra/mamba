@@ -60,48 +60,27 @@ def _fused5_ssd_kernel(
     # Synchronization
     first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk, grid_atomic, USE_ATOMIC_PID: tl.constexpr, sync_atomic,
     stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
-    # Matrix dimensions
+    # Tensor dimensions
     hdim, dstate, chunk_size, batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
-    ########################################
-    # Chunk State
-    ########################################
-    # Pointers to matrices
-    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
-    # Strides
+    # Tensor ptrs
+    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, cb_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
+    # Tensor strides
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
     stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
     stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
     stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
-    ########################################
-    # State Passing
-    ########################################
-    # Pointers to matrices
-    states_G_ptr,
-    # Strides
     stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
-    ########################################
-    # Chunk Scan
-    ########################################
-    # Pointers to matrices
-    cb_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr,
-    # Strides
     stride_cb_batch, stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_k,
     stride_z_batch, stride_z_seqlen, stride_z_head, stride_z_hdim,
     stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
     stride_C_batch, stride_C_seqlen, stride_C_head, stride_C_dstate,
     stride_D_head,
-    ########################################
-    # Chunk Cumsum
-    ########################################
-    # Pointers to matrices
-    A_ptr, dt_bias_ptr, dt_orig_ptr,
-    # dt limits
-    dt_min, dt_max,
-    # Strides
     stride_dt_orig_batch, stride_dt_orig_seqlen, stride_dt_orig_head,
     stride_A_head,
     stride_dt_bias_head,
+    # dt limits
+    dt_min, dt_max,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr, HAS_D: tl.constexpr, D_HAS_HDIM: tl.constexpr, HAS_Z: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr,
@@ -625,6 +604,7 @@ def _fused5_ssd(
 
     nheads_ngroups_ratio = nheads // ngroups
     _fused5_ssd_kernel[grid](
+        # Synchronization
         # bmm_wait_ptr, bmm_wait_stride_batch, bmm_wait_stride_chunk,
         sync_atomic[states_ready_size + grid_atomic_size: states_ready_size + grid_atomic_size+1],
         nchunks * 32, 32,
@@ -634,52 +614,26 @@ def _fused5_ssd(
         sync_atomic, nheads * hdim * dstate, hdim * dstate, dstate, 1,
 
         # Matrix dimensions
-        hdim, dstate, chunk_size,
-        batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
-        ########################################
-        # Originally Chunk State
-        ########################################
-        # Pointers to matrices
-        x, B, dt_out, dA_cumsum, seq_idx,# x_ptr, b_ptr, states_L_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
-        # Strides
+        hdim, dstate, chunk_size, batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
+        # Tensor ptrs
+        x, B, dt_out, dA_cumsum, seq_idx, states_G, CB, z, out, out_x, C, D, A, dt_bias, dt,
+        # Tensor strides
         x.stride(0), x.stride(1), x.stride(2), x.stride(3), # stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
         B.stride(0), B.stride(1), B.stride(2), B.stride(-1), # stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
         dt_out.stride(0), dt_out.stride(2), dt_out.stride(1), dt_out.stride(3), # stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
         dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3), # stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
         *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)), # stride_seq_idx_batch, stride_seq_idx_seqlen,
-        
-        ########################################
-        # Originally State Passing
-        ########################################
-        # Pointers to matrices
-        states_G,
-        # Strides
         states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3), states_G.stride(4),
-
-        ########################################
-        # Originally Chunk Scan
-        ########################################
-        # Pointers to matrices
-        CB, z, out, out_x, C, D,
-        # Strides
         CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(3), CB.stride(4),
         z_strides[0], z_strides[1], z_strides[2], z_strides[3],
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         C.stride(0), C.stride(1), C.stride(2), C.stride(3),
         D.stride(0) if D is not None else 0,
-
-        ########################################
-        # Originally Chunk Cumsum
-        ########################################
-        # ptrs
-        A, dt_bias, dt,
-        dt_limit[0], dt_limit[1],
-        # strides
         dt.stride(0), dt.stride(1), dt.stride(2),
         A.stride(0),
         dt_bias.stride(0) if dt_bias is not None else 0,
-
-
+        # dt limits
+        dt_limit[0], dt_limit[1],
         # Meta-parameters
         IS_CAUSAL=True,
         HAS_D=D is not None,

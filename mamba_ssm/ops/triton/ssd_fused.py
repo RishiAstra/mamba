@@ -25,26 +25,29 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
             }, num_stages=2, num_warps=4, maxnreg=256),
-        # # use this for autotuning, it makes hundreds of configs though
+        # Use this for autotuning, it makes hundreds of configs though
+        # You can also try other block size values not in the lists below
+        # It's probably best to autotune the BMM and CCS block sizes separate from the other block sizes,
+        # since they are for smaller amounts of work and are mostly independent
         # triton.Config({ 'BLOCK_SIZE_HD': BLOCK_SIZE_HD, 'BLOCK_SIZE_DS': BLOCK_SIZE_DS, 'BLOCK_SIZE_CS': BLOCK_SIZE_CS,
         #     'CS_BLOCK_SIZE_CS_outer': CS_BLOCK_SIZE_CS_outer, 'CS_BLOCK_SIZE_CS_inner': CS_BLOCK_SIZE_CS_inner, 'CS_BLOCK_SIZE_DS': CS_BLOCK_SIZE_DS,
         #     'CS_WHOLEBLOCK_DS': CS_WHOLEBLOCK_DS,
         #     'BMM_BLOCK_SIZE_M': BMM_BLOCK_SIZE_M, 'BMM_BLOCK_SIZE_N': BMM_BLOCK_SIZE_N, 'BMM_BLOCK_SIZE_K': BMM_BLOCK_SIZE_K,
         #     'CCS_BLOCK_SIZE_H': CCS_BLOCK_SIZE_H, }, num_stages=num_stages, num_warps=num_warps, maxnreg=maxnreg) \
-        #     for BLOCK_SIZE_HD in            [32, 64] \
-        #     for BLOCK_SIZE_DS in            [64, 128] \
+        #     for BLOCK_SIZE_HD in            [64] \
+        #     for BLOCK_SIZE_DS in            [128] \
         #     for BLOCK_SIZE_CS in            [128, 256] \
         #     for CS_BLOCK_SIZE_CS_outer in   [32, 64, 128, 256] \
         #     for CS_BLOCK_SIZE_CS_inner in   [32, 64, 128, 256] \
         #     for CS_BLOCK_SIZE_DS in         [32, 64, 128] \
         #     for CS_WHOLEBLOCK_DS in         [128] \
-        #     for BMM_BLOCK_SIZE_M in         [32, 64, 128] \
-        #     for BMM_BLOCK_SIZE_N in         [32, 64, 128] \
-        #     for BMM_BLOCK_SIZE_K in         [32, 64, 128] \
-        #     for CCS_BLOCK_SIZE_H in         [8, 16, 32] \
+        #     for BMM_BLOCK_SIZE_M in         [64] \
+        #     for BMM_BLOCK_SIZE_N in         [64] \
+        #     for BMM_BLOCK_SIZE_K in         [64] \
+        #     for CCS_BLOCK_SIZE_H in         [16] \
         #     for num_stages in               [1, 2] \
         #     for num_warps in                [4, 8] \
-        #     for maxnreg in                  [64, 128, 256] \
+        #     for maxnreg in                  [128, 256] \
     ],
     key=['hdim', 'dstate', 'chunk_size', 'IS_CAUSAL'],
 )
@@ -104,8 +107,10 @@ def _fused5_ssd_kernel(
     The config is extremely sensitive, and exhaustive autotuning can generate hundreds of configs.
     * The config and / or kernel may need slight changes to be optimal for other models, currently tuned on Mamba2-2.7B.
     * This kernel can handle larger batch * seqlen than the original kernels (which get either bad output or illegal memory accesses from int32 overflow).
-    * This kernel could have slightly different output due to a different order of operations and casting (fp16 intermediate results instead of fp32), though in a quick test it gets the exact same output.
-    * HAS_Z is not tested, and this kernel was only tested on an A100 and H100.
+    If you do get illegal memory access for extreme batch * seqlen, you might need to cast more strides (e.g. any stride dependent on seqlen or nchunks) to int64.
+    * This kernel could have slightly different output due to a different order of operations and casting (fp16 intermediate results instead of fp32),
+    though in a quick test it gets the exact same output.
+    * HAS_Z is not tested, NEED_MASK_*=True is not tested, and this kernel was only tested on an A100 and H100.
     
     :param first2_wait_ptr: The atomic sync tensor for waiting for bmm and cumsum to be ready
     :param grid_atomic: The atomic counter to get pids from, making sure that previous pids are either concurrent or finished
@@ -130,11 +135,6 @@ def _fused5_ssd_kernel(
     :param BLOCK_SIZE_DSTATE: the state dim (dstate) rounded up pwr2
     :param BLOCK_SIZE_CHUNK: the chunk size rounded up pwr2
     """
-    # tl.static_print(f"NEED_MASK_HD: {NEED_MASK_HD}")
-    # tl.static_print(f"NEED_MASK_CS_DS: {NEED_MASK_CS_DS}")
-    # tl.static_print(f"NEED_MASK_CS_CS_outer: {NEED_MASK_CS_CS_outer}")
-    # tl.static_print(f"NEED_MASK_CS_CS_inner: {NEED_MASK_CS_CS_inner}")
-    # tl.static_print(f"NEED_MASK_1_DS: {NEED_MASK_1_DS}")
     # some strides must be 64-bit to prevent int32 overflow
     # for now, only do the batch size for the largest things
     stride_x_batch = stride_x_batch.to(tl.int64)
@@ -143,31 +143,6 @@ def _fused5_ssd_kernel(
     stride_out_batch = stride_out_batch.to(tl.int64)
     stride_C_batch = stride_C_batch.to(tl.int64)
     stride_states_G_batch = stride_states_G_batch.to(tl.int64)
-    # the following are roughly ordered from largest to smallest
-    # things with batch, seqlen, and ~32*128x more
-    # stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
-    # stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
-    # stride_z_batch, stride_z_seqlen, stride_z_head, stride_z_hdim,
-    # stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
-    # stride_C_batch, stride_C_seqlen, stride_C_head, stride_C_dstate,
-    # stride_states_L_batch, stride_states_L_chunk, stride_states_L_head, stride_states_L_hdim, stride_states_L_dstate,
-    # stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
-    # # things with batch, seqlen, and ~32x more
-    # stride_dt_orig_batch, stride_dt_orig_seqlen, stride_dt_orig_head,
-    # stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
-    # stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
-    # stride_cb_batch, stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_k,
-    # # things with batch, seqlen
-    # stride_seq_idx_batch, stride_seq_idx_seqlen,
-    # stride_dA_ccs_batch, stride_dA_ccs_chunk, stride_dA_ccs_head,
-    # # things with batch, ~32*128^2x more
-    # stride_final_states_batch, stride_final_states_head, stride_final_states_hdim, stride_final_states_dstate,
-    # stride_initstates_batch, stride_initstates_head, stride_initstates_hdim, stride_initstates_dstate,
-    # # constant size things
-    # stride_D_head,
-    # stride_A_head,
-    # stride_dt_bias_head,
-
 
     if USE_ATOMIC_PID:
         # order does not matter, just need previous threadblocks concurrently running or finished
@@ -181,15 +156,14 @@ def _fused5_ssd_kernel(
     num_pid_m = tl.cdiv(chunk_size, BMM_BLOCK_SIZE_M)
     num_pids_bmm = num_pid_n * num_pid_m * batch * nchunks * ngroups
 
+    ########################################
+    # Chunk Cumsum
+    ########################################
     if pid_og < num_pids_css:
-        ########################################
-        # Chunk Cumsum
-        ########################################
         pid_ccs = pid_og
         pid_b = pid_ccs % batch
         pid_c = (pid_ccs // batch) % nchunks
         pid_h = (pid_ccs // (batch * nchunks)) % ccs_num_pid_h
-
 
         css_dt_ptr = dt_orig_ptr + pid_b * stride_dt_orig_batch + pid_c * chunk_size * stride_dt_orig_seqlen
         css_dt_out_ptr = dt_ptr + pid_b * stride_dt_batch + pid_c * stride_dt_chunk
@@ -222,11 +196,10 @@ def _fused5_ssd_kernel(
 
         # mark progress
         tl.atomic_add(first2_wait_ptr + pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk, CCS_BLOCK_SIZE_H, sem='release')
-
+    ########################################
+    # BMM (CB)
+    ########################################
     elif pid_og < num_pids_css + num_pids_bmm:
-        ########################################
-        # BMM (CB)
-        ########################################
         pid_bmm = pid_og - num_pids_css
         pid_n = pid_bmm % num_pid_n
         pid_m = (pid_bmm // num_pid_n) % num_pid_m
@@ -273,8 +246,8 @@ def _fused5_ssd_kernel(
         return
     pid_fused3 = pid_og - (num_pids_css + num_pids_bmm)
 
-    # pids same for all 3 parts
-    # all pids represent domain parallelism except pid_c for state passing
+    # pids for batch, heads, and chunks are the same for chunk state, state passing, and chunk scan
+    # all pids represent domain parallelism except pid_c for state passing (which becomes serialized due to sync)
     num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
     num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     pid_h = pid_fused3 % nheads
@@ -297,10 +270,6 @@ def _fused5_ssd_kernel(
     ########################################
     # Chunk State
     ########################################
-
-    # chunk state ptrs
-    if HAS_SEQ_IDX:
-        seq_idx_ptr_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
@@ -327,12 +296,12 @@ def _fused5_ssd_kernel(
         dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
         dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
         if HAS_SEQ_IDX:
-            seq_idx_ptrs_cs = seq_idx_ptr_cs + offs_cs * stride_seq_idx_seqlen
+            seq_idx_ptrs_cs = seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
 
         # chunk state other setup
         chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
         if HAS_SEQ_IDX:
-            seq_idx_last = tl.load(seq_idx_ptr_cs + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
+            seq_idx_last = tl.load(seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
         # chunk state chunk_size loop
         acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
@@ -406,14 +375,11 @@ def _fused5_ssd_kernel(
         sync_atomic += stride_sync_dstate
 
 
-
-
     ########################################
     # Chunk Scan
     ########################################
     # pids same for all 3 parts
     # all pids represent domain parallelism except pid_c for state passing
-    # cs_num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS_outer)
 
     if HAS_SEQ_IDX:

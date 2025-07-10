@@ -145,7 +145,9 @@ def run_unit_test(seqlen):
     bad_i = -1
     # compare all to the first
     for i in range(1, len(outputs), 1):
-        if torch.allclose(outputs[i], outputs[0], atol=atol_given if USE_GIVEN_TEST_TENSORS else atol_rand, rtol=1e-2, equal_nan=True):
+        atol = atol_given if USE_GIVEN_TEST_TENSORS else atol_rand
+        rtol = 1e-2
+        if torch.allclose(outputs[i], outputs[0], atol=atol, rtol=rtol, equal_nan=True):
             print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")
         else:
             print(f"❌ {things_to_compare[i][1]} and {things_to_compare[0][1]} differ")
@@ -156,6 +158,11 @@ def run_unit_test(seqlen):
         max_rdiff_idx = torch.argmax(torch.abs((outputs[i] - outputs[0]) / outputs[0]))
         max_rdiff = torch.abs((outputs[i].reshape(-1)[max_rdiff_idx] - outputs[0].reshape(-1)[max_rdiff_idx] / outputs[0].reshape(-1)[max_rdiff_idx]))
         print(f"max rel diff: {max_rdiff} for {max_rdiff_idx} index, a: {outputs[i].reshape(-1)[max_rdiff_idx]}, b: {outputs[0].reshape(-1)[max_rdiff_idx]}")
+        fail_bools = torch.abs(outputs[i] - outputs[0]) > atol + rtol * torch.abs(outputs[0])
+        fail_bool_num = fail_bools.sum().cpu().item()
+        total_elems = outputs[0].numel()
+        print(f"failed elements / total: {fail_bool_num} / {total_elems}, {fail_bool_num / total_elems * 100.0}%")
+
 
     if bad_i >= 0 and PRINT_BAD_TENSOR:
         np.savetxt('bad_output.txt', outputs[bad_i].cpu().numpy(), fmt="%.2e")

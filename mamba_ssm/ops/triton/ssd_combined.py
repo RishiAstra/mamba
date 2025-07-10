@@ -279,7 +279,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt.to(dtype=dt.dtype), dD
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), fused=False):
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), fused=True):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -311,10 +311,9 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if fused:
         # all 5 kernels fused
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
-            C, B, x, C.dtype, D,
-            dt, A, chunk_size,
-            initial_states=initial_states, seq_idx=seq_idx, states_in_fp32=True, z=z,
-            dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
+            x, dt, A, B, C, D,
+            chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z, out_dtype=C.dtype,
+            states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
         )
     else:
         # original

@@ -494,11 +494,37 @@ def _fused5_ssd_kernel(
 
 
 def _fused5_ssd(
-    C, B, x, out_dtype, D,
-    dt, A, chunk_size,
-    initial_states=None, seq_idx=None, states_in_fp32=False, z=None, use_atomic_pid=True, # if True, don't count on 1d grid launching in order
-    dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
+    x, dt, A, B, C, D,
+    chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False, out_dtype=torch.float16,
+    use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
 ):
+    """
+    Runs the Mamba2 SSD with 1 large fused kernel instead of the 5 original kernels, should be about 2-3x faster on an A100 or H100.
+    Note:
+    * Only tested on an A100 and H100
+    * Optimized and tested for Mamba2-2.7B fp16 (headdim=64, dstate=128, etc)
+    * Can handle larger batch * seqlen than the original
+    * Could have slightly different output, but had the exact same in a basic test
+
+    :param x: The input x
+    :param dt: The delta time dt
+    :param A: SSM A (for old state -> state)
+    :param B: SSM B (for x -> state)
+    :param C: SSM C (for state -> y)
+    :param D: SSM D (for x -> y)
+    :param chunk_size: The chunk size, i.e. base case / size for the Mamba2 efficient algorithm to use Tensor Cores at. Tested for 256 only.
+    :param initial_states: The initial states to start with, can be used for chunked prefil or starting from a precomputed state.
+    :param seq_idx: Can be used for variable seqlen, see https://github.com/state-spaces/mamba/issues/383. Not fully tested.
+    :param z: The non-SSM path (not to be confused with residual x) like an MLP gate. Not tested because for Mamba2-2.7B the layernorm handles it.
+    :param states_in_fp32: Should the states be in fp32 instead of fp16? Recommended false.
+    :param out_dtype: The type for the output (fp16 recommended)
+    :param use_atomic_pid: If False, we assume that the GPU driver will launch pids in increasing order. Might not be necessary for particular GPUs and GPU drivers, but doesn't cost much performance.
+    :param dt_bias: bias for dt
+    :param dt_softplus: should we use the softplus function on dt?
+    :param dt_limit: clamp for dt
+    """
+    # TODO: seq_idx example instead of github issue link
+
     batch, seqlen, nheads, hdim = x.shape
     # setup from chunk cumsum
     assert A.shape == (nheads,)

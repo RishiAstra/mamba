@@ -278,8 +278,9 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
             dD = rearrange(dD, "h 1 -> h")
     return dx, ddt.to(dtype=dt.dtype), dD
 
-
+# counter = 0
 def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), fused=True):
+    # global counter
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -307,6 +308,14 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
+    # torch.save(A,       f"dump_f5/A_in{counter}")
+    # torch.save(B,       f"dump_f5/B_in{counter}")
+    # torch.save(C,       f"dump_f5/C_in{counter}")
+    # torch.save(D,       f"dump_f5/D_in{counter}")
+    # torch.save(dt_bias, f"dump_f5/dt_bias_in{counter}")
+    # torch.save(dt,      f"dump_f5/dt_in{counter}")
+    # torch.save(x,       f"dump_f5/x_in{counter}")
+    # counter += 1
 
     if fused:
         # all 5 kernels fused

@@ -1,6 +1,6 @@
 # some code from https://triton-lang.org/main/getting-started/tutorials/...
 
-CHECK_CORRECTNESS = False
+CHECK_CORRECTNESS = True
 USE_GIVEN_TEST_TENSORS = True # real prompt data, loads from files
 if not CHECK_CORRECTNESS:
     USE_GIVEN_TEST_TENSORS = False
@@ -70,7 +70,7 @@ configs.append(
 
 # used to load actual tensors from files
 counter = 64 # skip warmup tensors, but warmup tensors should be the same anyway
-def get_rand_input(dims_b_seq_nh_hd_ng_ds):
+def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
     torch.manual_seed(0)
 
@@ -84,13 +84,14 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds):
 
     # NOTE: overrides the sizes
     if USE_GIVEN_TEST_TENSORS:
-        A =         torch.load(f"dump/A_in{counter}")
-        B =         torch.load(f"dump/B_in{counter}")
-        C =         torch.load(f"dump/C_in{counter}")
-        D =         torch.load(f"dump/D_in{counter}")
-        dt_bias =   torch.load(f"dump/dt_bias_in{counter}")
-        dt =        torch.load(f"dump/dt_in{counter}")
-        x =         torch.load(f"dump/x_in{counter}")
+        dump_name = "dump_f5" if not is_original else "dump"
+        A =         torch.load(f"{dump_name}/A_in{counter}")
+        B =         torch.load(f"{dump_name}/B_in{counter}")
+        C =         torch.load(f"{dump_name}/C_in{counter}")
+        D =         torch.load(f"{dump_name}/D_in{counter}")
+        dt_bias =   torch.load(f"{dump_name}/dt_bias_in{counter}")
+        dt =        torch.load(f"{dump_name}/dt_in{counter}")
+        x =         torch.load(f"{dump_name}/x_in{counter}")
 
     if have_init_states:
         initial_states = torch.randn((batch, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
@@ -122,13 +123,23 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds):
 
 def run_unit_test(seqlen):
     # raise Exception("Not implemented")
-    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen))
+    
     CHUNK_SIZE=256
 
-    outputs_full = [thing[0](
+    outputs_full = []
+
+    for i, thing in enumerate(things_to_compare):
+        dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen), is_original=i==0)
+
+        outputs_full.append(thing[0](
             x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
-            ) for thing in things_to_compare]
+        ))
+
+    # outputs_full = [thing[0](
+    #         x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
+    #         initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
+    #         ) for thing in things_to_compare]
     field_names = ["out", "out_x", "dt", "dA_cumsum", "states", "final_states"]
     for field_idx in range(len(outputs_full[0])):
         outputs_0 = outputs_full[0][field_idx]

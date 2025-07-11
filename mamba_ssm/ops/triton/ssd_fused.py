@@ -106,8 +106,7 @@ def _fused5_ssd_kernel(
     * The config and / or kernel may need slight changes to be optimal for other models, currently tuned on Mamba2-2.7B.
     * This kernel can handle larger batch * seqlen than the original kernels (which get either bad output or illegal memory accesses from int32 overflow).
     If you do get illegal memory access for extreme batch * seqlen, you might need to cast more strides (e.g. any stride dependent on seqlen or nchunks) to int64.
-    * This kernel could have slightly different output due to a different order of operations and casting (fp16 intermediate results instead of fp32),
-    though in a quick test it gets the exact same output.
+    * This kernel could have very slightly different output due to a different order of operations and casting (fp16 intermediate results instead of fp32),
     * HAS_Z is not tested, NEED_MASK_*=True is not tested, and this kernel was only tested on an A100 and H100.
     
     :param first2_wait_ptr: The atomic sync tensor for waiting for bmm and cumsum to be ready
@@ -497,12 +496,13 @@ def _fused5_ssd(
     use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
 ):
     """
-    Runs the Mamba2 SSD with 1 large fused kernel instead of the 5 original kernels, should be about 2-3x faster on an A100 or H100.
+    Runs the Mamba2 SSD with 1 large fused kernel instead of the 5 original kernels,
+    should be about 2.5x, 1.5x, or 2x faster for small, medium, or large sizes on an A100 or H100.
     Note:
     * Only tested on an A100 and H100
     * Optimized and tested for Mamba2-2.7B fp16 (headdim=64, dstate=128, etc)
     * Can handle larger batch * seqlen than the original
-    * Could have slightly different output, but had the exact same in a basic test
+    * Could have slightly different output, but very close
 
     :param x: The input x
     :param dt: The delta time dt

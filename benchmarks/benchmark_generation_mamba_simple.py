@@ -25,6 +25,7 @@ parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--minp", type=float, default=0.0)
 parser.add_argument("--repetition-penalty", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
+parser.add_argument("--fused-mamba2", action='store_true', help="Enable faster fused Mamba2 prefill")
 args = parser.parse_args()
 
 repeats = 3
@@ -52,6 +53,8 @@ else:
     attn_mask = tokens.attention_mask.to(device=device)
 max_length = input_ids.shape[1] + args.genlen
 
+model_kwargs = {"use_mamba2_fused5_ssd": True} if args.fused_mamba2 else {}
+
 if is_mamba:
     fn = lambda: model.generate(
         input_ids=input_ids,
@@ -65,6 +68,7 @@ if is_mamba:
         top_p=args.topp,
         min_p=args.minp,
         repetition_penalty=args.repetition_penalty,
+        **model_kwargs,
     )
 else:
     fn = lambda: model.generate(
@@ -78,6 +82,7 @@ else:
         top_k=args.topk,
         top_p=args.topp,
         repetition_penalty=args.repetition_penalty,
+        **model_kwargs,
     )
 out = fn()
 if args.prompt is not None:

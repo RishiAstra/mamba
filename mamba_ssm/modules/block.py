@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 from torch import nn, Tensor
 
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
 
@@ -64,6 +65,11 @@ class Block(nn.Module):
                 eps=self.norm.eps,
                 is_rms_norm=isinstance(self.norm, RMSNorm)
             )
+
+        # Handle special fused kernel for Mamba2
+        if "use_mamba2_fused5_ssd" in mixer_kwargs and not isinstance(self.mixer, Mamba2):
+            # don't modify original reference
+            mixer_kwargs = mixer_kwargs.copy().pop("use_mamba2_fused5_ssd")
         hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
 
         if self.mlp is not None:

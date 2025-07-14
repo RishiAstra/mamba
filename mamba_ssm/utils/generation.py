@@ -133,7 +133,8 @@ def decode(
     cg=False,
     enable_timing=False,
     output_scores=False,
-    streamer: Optional[TextStreamer] = None
+    streamer: Optional[TextStreamer] = None,
+    **model_kwargs,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -164,6 +165,7 @@ def decode(
             batch_size,
             seqlen_og,
             max_length,
+            **model_kwargs,
         )
         inference_params = model._decoding_cache.inference_params
         inference_params.reset(max_length, batch_size)
@@ -187,6 +189,7 @@ def decode(
                 position_ids=position_ids,
                 inference_params=inference_params,
                 num_last_tokens=1,
+                **model_kwargs,
             ).logits.squeeze(dim=1)
         else:
             logits = model._decoding_cache.run(
@@ -290,6 +293,7 @@ def update_graph_cache(
     decoding_seqlens=(1,),
     dtype=None,
     n_warmups=2,
+    **model_kwargs,
 ):
     if cache is None:
         cache = DecodingCGCache()
@@ -329,6 +333,7 @@ def update_graph_cache(
                 decoding_seqlen=decoding_seqlen,
                 mempool=cache.mempool,
                 n_warmups=n_warmups,
+                **model_kwargs,
             )
 
     def dispatch(input_ids, position_ids, seqlen):
@@ -341,7 +346,7 @@ def update_graph_cache(
 
 
 def capture_graph(
-    model, inference_params, batch_size, max_seqlen, decoding_seqlen=1, mempool=None, n_warmups=2
+    model, inference_params, batch_size, max_seqlen, decoding_seqlen=1, mempool=None, n_warmups=2, **model_kwargs,
 ):
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
@@ -360,6 +365,7 @@ def capture_graph(
                 position_ids=position_ids,
                 inference_params=inference_params,
                 num_last_tokens=decoding_seqlen,
+                **model_kwargs,
             ).logits
         s.synchronize()
         # This might be needed for correctness if we run with NCCL_GRAPH_MIXING_SUPPORT=0,
@@ -377,6 +383,7 @@ def capture_graph(
             position_ids=position_ids,
             inference_params=inference_params,
             num_last_tokens=decoding_seqlen,
+            **model_kwargs,
         ).logits
 
     def run(new_input_ids, new_position_ids, seqlen):

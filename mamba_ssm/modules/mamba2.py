@@ -151,7 +151,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
 
-    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None, use_mamba2_fused5_ssd=False):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
@@ -200,6 +200,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 ngroups=self.ngroups,
                 norm_before_gate=self.norm_before_gate,
                 **dt_limit_kwargs,
+                use_fused5_ssd=use_mamba2_fused5_ssd,
             )
             if seqlen_og is not None:
                 out = rearrange(out, "b l d -> (b l) d")
@@ -257,6 +258,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 **dt_limit_kwargs,
                 return_final_states=ssm_state is not None,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
+                use_fused5_ssd=use_mamba2_fused5_ssd,
             )
             if ssm_state is not None:
                 y, last_state, *rest = y

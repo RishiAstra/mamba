@@ -70,7 +70,7 @@ configs.append(
 
 # used to load actual tensors from files
 counter = 64 # skip warmup tensors, but warmup tensors should be the same anyway
-def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original):
+def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
     torch.manual_seed(0)
 

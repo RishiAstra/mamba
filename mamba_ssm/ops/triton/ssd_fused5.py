@@ -24,6 +24,8 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
+            # layernorm seqlen per threadblock (<= chunk_size)
+            'LAYERNORM_TB_SEQ': 16, 'LAYERNORM_SEQ_BLOCK': 1,
             }, num_stages=1, num_warps=4, maxnreg=128),
         # Use this for autotuning, it makes hundreds of configs though
         # You can also try other block size values not in the lists below
@@ -94,6 +96,7 @@ def _fused5_ssd_kernel(
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
     BMM_BLOCK_SIZE_M: tl.constexpr, BMM_BLOCK_SIZE_N: tl.constexpr, BMM_BLOCK_SIZE_K: tl.constexpr,
     CCS_BLOCK_SIZE_H: tl.constexpr,
+    LAYERNORM_TB_SEQ: tl.constexpr, LAYERNORM_SEQ_BLOCK: tl.constexpr,
     # pwr2 dim constexprs
     BLOCK_SIZE_DSTATE: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
     BLOCK_SIZE_LAYERNORM: tl.constexpr,
@@ -502,8 +505,10 @@ def _fused5_ssd_kernel(
             tl.atomic_add(layernorm_wait_ptr + pid_b * layernorm_wait_stride_batch + pid_c * layernorm_wait_stride_chunk, BLOCK_SIZE_HD)
     elif HAS_LAYERNORM:
         pid_layernorm = pid_og - (num_pids_bmm + num_pids_css + num_pids_fused3)
-        pid_c = pid_layernorm % nchunks
-        pid_b = pid_layernorm // nchunks
+        n_subc = tl.cdiv(chunk_size, LAYERNORM_TB_SEQ)
+        pid_subc = pid_layernorm % n_subc
+        pid_c = (pid_layernorm // n_subc) % nchunks
+        pid_b = (pid_layernorm // (n_subc * nchunks))
         # await data
         layernorm_wait_ptr += pid_b * layernorm_wait_stride_batch + pid_c * layernorm_wait_stride_chunk
         wait_val = tl.atomic_add(layernorm_wait_ptr, 0)
@@ -511,34 +516,41 @@ def _fused5_ssd_kernel(
         while wait_val < wait_target:
             wait_val = tl.atomic_add(layernorm_wait_ptr, 0)
 
-        X = out_x_ptr + pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen
-        Y = out_ptr + pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen
-        Z = z_ptr + pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen
+        seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
+        X = out_x_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+        Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+        Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
         chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-        for i in range(0, chunk_size_limit):
+        tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
+        for i in range(pid_subc * LAYERNORM_TB_SEQ, tb_chunk_end, LAYERNORM_SEQ_BLOCK):
             # TODO: make sure heads contiguous?
             dim = nheads * hdim # TODO: allow non-pwr2
             # Map the program id to the row of X and Y it should compute.
             # Compute mean and variance
+            rows = tl.arange(0, LAYERNORM_SEQ_BLOCK)
             cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
-            x = tl.load(X + cols, mask=cols < dim, other=0.).to(tl.float32)
+            mask=(cols < dim)[None, :] & (rows < tb_chunk_end)[:, None]
+            # TODO: don't assumb contiguous
+            x_ptrs = X + rows[:, None] * dim + cols[None, :]
+            x = tl.load(x_ptrs, mask=mask, other=0.).to(tl.float32)
             xbar = tl.where(cols < dim, x, 0.)
-            var = tl.sum(xbar * xbar, axis=0) / dim
+            var = tl.sum(xbar * xbar, axis=1) / dim
             rstd = 1 / tl.sqrt(var + rmsnorm_eps)
-            tl.store(rstd_ptr + pid_b * seqlen + pid_c * chunk_size + i, rstd)
+            tl.store(rstd_ptr + pid_b * seqlen + pid_c * chunk_size + i + rows, rstd, mask=rows < tb_chunk_end)
             # Normalize and apply linear transformation
-            mask = cols < dim
-            w = tl.load(rmsnorm_weight + cols, mask=mask).to(tl.float32)
-            x_hat = x * rstd
+            w = tl.load(rmsnorm_weight + cols, mask=cols < dim).to(tl.float32)
+            x_hat = x * rstd[:, None]
             y = x_hat * w
-            z = tl.load(Z + cols, mask=mask).to(tl.float32)
+            z_ptrs = Z + rows[:, None] * dim + cols[None, :]
+            z = tl.load(z_ptrs, mask=mask).to(tl.float32)
             y *= z * tl.sigmoid(z)
             # Write output
-            tl.store(Y + cols, y, mask=mask)
+            y_ptrs = Y + rows[:, None] * dim + cols[None, :]
+            tl.store(y_ptrs, y, mask=mask)
             # move within chunk along seqlen
-            X += stride_out_seqlen
-            Y += stride_out_seqlen
-            Z += stride_z_seqlen
+            X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+            Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+            Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
 
 def _fused5_ssd(
     x, dt, A, B, C, D,
@@ -647,7 +659,7 @@ def _fused5_ssd(
         # fused3 grid
         batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']) +
         # layernorm grid
-        (0 if not norm_before_gate else batch * nchunks)
+        (0 if not norm_before_gate else batch * nchunks * triton.cdiv(chunk_size, META['LAYERNORM_TB_SEQ']))
     ,)
 
     # for some reason, it's far faster to do this outside of the kernel

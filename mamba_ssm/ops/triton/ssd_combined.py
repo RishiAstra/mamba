@@ -292,7 +292,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt.to(dtype=dt.dtype), dD
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused5_ssd=False):
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused5_ssd=False, fused5_norm_before_gate=True, fused5_rmsnorm_weight=None, fused5_rmsnorm_eps=1e-6):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -321,10 +321,11 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
     if use_fused5_ssd: # all 5 kernels fused
-        out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
+        out, out_x, states, final_states, dA_cumsum, dt, rstd = _fused5_ssd(
             x, dt, A, B, C, D,
             chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z, out_dtype=C.dtype,
             states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
+            norm_before_gate=fused5_norm_before_gate, rmsnorm_weight=fused5_rmsnorm_weight, rmsnorm_eps=fused5_rmsnorm_eps
         )
     else: # original
         # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
@@ -346,12 +347,17 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
 
     if cu_seqlens is None:
-        return out, out_x, dt, dA_cumsum, states, final_states
+        retvals = out, out_x, dt, dA_cumsum, states, final_states
     else:
         assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
         varlen_states = chunk_state_varlen(B.squeeze(0), x.squeeze(0), dt.squeeze(0), dA_cumsum.squeeze(0),
                                            cu_seqlens, states.squeeze(0))
-        return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+        retvals = out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+
+    if fused5_norm_before_gate:
+        return *retvals, rstd
+    else:
+        return retvals
 
 
 def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None, z=None,

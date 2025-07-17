@@ -242,6 +242,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            if self.norm.weight is not None and use_mamba2_fused5_ssd and d_mlp == 0 and self.ngroups == 1:
+                use_fused6_norm = True
+            else:
+                use_fused6_norm = False
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
@@ -250,7 +254,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
                 chunk_size=self.chunk_size,
                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if (not self.rmsnorm) or use_fused6_norm else None,
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
                 seq_idx=seq_idx,
@@ -259,6 +263,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 return_final_states=ssm_state is not None,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
                 use_fused5_ssd=use_mamba2_fused5_ssd,
+                use_fused6_norm=use_fused6_norm,
+                norm_before_gate=self.norm_before_gate,
+                rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+                rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
             )
             if ssm_state is not None:
                 y, last_state, *rest = y
@@ -268,7 +276,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     varlen_states = rest[0]
                     ssm_state.copy_(varlen_states)
             y = rearrange(y, "b l h p -> b l (h p)")
-            if self.rmsnorm:
+            if self.rmsnorm and not use_fused6_norm:
                 y = self.norm(y, z)
             if d_mlp > 0:
                 y = torch.cat([F.silu(z0) * x0, y], dim=-1)

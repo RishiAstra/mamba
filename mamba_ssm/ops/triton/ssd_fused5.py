@@ -25,7 +25,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
             # layernorm seqlen per threadblock (<= chunk_size)
-            'LAYERNORM_TB_SEQ': 16, 'LAYERNORM_SEQ_BLOCK': 1,
+            'LAYERNORM_TB_SEQ': 64, 'LAYERNORM_SEQ_BLOCK': 1,
             }, num_stages=1, num_warps=4, maxnreg=128),
         # Use this for autotuning, it makes hundreds of configs though
         # You can also try other block size values not in the lists below
@@ -91,6 +91,7 @@ def _fused5_ssd_kernel(
     IS_CAUSAL: tl.constexpr, HAS_D: tl.constexpr, D_HAS_HDIM: tl.constexpr, HAS_Z: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr,
     HAS_LAYERNORM: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
     # Block sizes
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, 
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
@@ -249,9 +250,8 @@ def _fused5_ssd_kernel(
         tl.atomic_add(first2_wait_ptr + pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
 
     # is this threadblock for the last 3 fused kernels?
-    elif not HAS_LAYERNORM or pid_og < (num_pids_css + num_pids_bmm + num_pids_fused3):
+    else:
         pid_fused3 = pid_og - (num_pids_css + num_pids_bmm)
-
         # pids for batch, heads, and chunks are the same for chunk state, state passing, and chunk scan
         # all pids represent domain parallelism except pid_c for state passing (which becomes serialized due to sync)
         num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
@@ -259,304 +259,334 @@ def _fused5_ssd_kernel(
         pid_c = (pid_fused3 // (nheads)) % nchunks
         pid_b = (pid_fused3 // (nheads * nchunks)) % batch
         pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
+        num_fused3_pids_per_bc = nheads * num_pid_hd
+        num_layernorm_pids_per_bc = 0 if not HAS_LAYERNORM else ngroups * tl.cdiv(chunk_size, LAYERNORM_TB_SEQ)
+        num_smaller_pids = num_fused3_pids_per_bc + num_layernorm_pids_per_bc
+        pid_small = pid_fused3 % num_smaller_pids
+        pid_c = (pid_fused3 // num_smaller_pids) % nchunks
+        pid_b = (pid_fused3 // (num_smaller_pids * nchunks)) % batch
+        
+        # interleave steps for L2 cache hit rate
+        pid_h = pid_small % nheads
+        pid_hd = pid_small // nheads
+        pid_ln = pid_small - num_fused3_pids_per_bc
 
-        # advance ptrs up front to simplify and slightly reduce register pressure
-        # does actually provide a small benefit vs the original separate ptrs per step
-        states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head + pid_c * stride_states_G_chunk
-        x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
-        b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
-        dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
-        dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
-        cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
-        C_ptr += pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
-        out_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
-        sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim# + pid_ds * stride_sync_dstate
+        if pid_ln < 0 or not HAS_LAYERNORM:
+            # advance ptrs up front to simplify and slightly reduce register pressure
+            # does actually provide a small benefit vs the original separate ptrs per step
+            states_G_ptr += pid_b * stride_states_G_batch + pid_h * stride_states_G_head + pid_c * stride_states_G_chunk
+            x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
+            b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
+            dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
+            dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+            cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
+            C_ptr += pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
+            out_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
+            sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim# + pid_ds * stride_sync_dstate
 
-        ########################################
-        # Chunk State
-        ########################################
+            ########################################
+            # Chunk State
+            ########################################
 
-        if HAS_SEQ_IDX:
-            seq_idx_ptr += pid_b * stride_seq_idx_batch
+            if HAS_SEQ_IDX:
+                seq_idx_ptr += pid_b * stride_seq_idx_batch
 
-        # wait for this (batch, chunk)
-        first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
-        first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
-        # includes both, cumsum + bmm
-        while first2_wait_val < nheads + num_pid_n * BMM_BLOCK_SIZE_N * num_pid_m * BMM_BLOCK_SIZE_M * ngroups:
+            # wait for this (batch, chunk)
+            first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
             first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
+            # includes both, cumsum + bmm
+            while first2_wait_val < nheads + num_pid_n * BMM_BLOCK_SIZE_N * num_pid_m * BMM_BLOCK_SIZE_M * ngroups:
+                first2_wait_val = tl.atomic_add(first2_wait_ptr, 0, sem='acquire')
 
-        offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
+            offs_hd = pid_hd * BLOCK_SIZE_HD + tl.arange(0, BLOCK_SIZE_HD)
 
-        for pid_ds in range(0, num_pid_ds, 1):
-            # chunk state offsets
-            # NOTE: m ->hdim, n -> dstate, k -> chunk_size
-            offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
-            offs_cs = tl.arange(0, BLOCK_SIZE_CS)
+            for pid_ds in range(0, num_pid_ds, 1):
+                # chunk state offsets
+                # NOTE: m ->hdim, n -> dstate, k -> chunk_size
+                offs_ds = pid_ds * BLOCK_SIZE_DS + tl.arange(0, BLOCK_SIZE_DS)
+                offs_cs = tl.arange(0, BLOCK_SIZE_CS)
 
-            # chunk state ptr blocks
-            x_ptrs_cs = x_ptr + (offs_hd[:, None] * stride_x_hdim + offs_cs[None, :] * stride_x_seqlen)
-            b_ptrs_cs = b_ptr + (offs_ds[None, :] * stride_b_dstate + offs_cs[:, None] * stride_b_seqlen)
-            dt_ptrs_cs = dt_ptr + offs_cs * stride_dt_csize
-            dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
-            dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
-            if HAS_SEQ_IDX:
-                seq_idx_ptrs_cs = seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
-
-            # chunk state other setup
-            chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-            if HAS_SEQ_IDX:
-                seq_idx_last = tl.load(seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
-
-            # chunk state chunk_size loop
-            acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
-            for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
-                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                    x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
-                    b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
-                else:
-                    x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
-                    b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
-                dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
+                # chunk state ptr blocks
+                x_ptrs_cs = x_ptr + (offs_hd[:, None] * stride_x_hdim + offs_cs[None, :] * stride_x_seqlen)
+                b_ptrs_cs = b_ptr + (offs_ds[None, :] * stride_b_dstate + offs_cs[:, None] * stride_b_seqlen)
+                dt_ptrs_cs = dt_ptr + offs_cs * stride_dt_csize
+                dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
+                dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
                 if HAS_SEQ_IDX:
-                    seq_idx_k = tl.load(seq_idx_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=-1)
-                dt_k = tl.load(dt_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
-                if not HAS_SEQ_IDX:
-                    scale = tl.exp((dA_cs_last - dA_cs_k)) * dt_k
-                else:
-                    scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
-                b *= (scale[:, None]).to(x_ptr.dtype.element_ty)
-                acc += tl.dot(x, b, out_dtype=acc.dtype)
-                x_ptrs_cs += BLOCK_SIZE_CS * stride_x_seqlen
-                b_ptrs_cs += BLOCK_SIZE_CS * stride_b_seqlen
-                dt_ptrs_cs += BLOCK_SIZE_CS * stride_dt_csize
-                dA_cumsum_ptrs_cs += BLOCK_SIZE_CS * stride_dA_cs_csize
+                    seq_idx_ptrs_cs = seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
+
+                # chunk state other setup
+                chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
                 if HAS_SEQ_IDX:
-                    seq_idx_ptrs_cs += BLOCK_SIZE_CS * stride_seq_idx_seqlen
-            states = acc
+                    seq_idx_last = tl.load(seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
-
-
-        ########################################
-        # State Passing
-        ########################################
-            state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
-
-            main_mask = None if ((not NEED_MASK_HD) and (not NEED_MASK_1_DS)) else (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
-
-            # offset gets us to the end of each chunk
-            dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
-            scale = tl.exp(dA_cs)
-            if HAS_SEQ_IDX:
-                # TODO: need atomics here?
-                seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-                seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
-            # sync
-            # the atomic represents which pid_c is ready
-            # therefore, wait for it to reach our pid_c
-            sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-            while sync_val < pid_c:
-                sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
-
-            # need to load states from previous one (but already offset by 1 so no offset)
-            if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                states_prev = tl.load(state_G_ptrs)
-            else:
-                states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
-
-            states_mod = scale * states_prev + states # NOTE: scale.to(tl.float16) seems to slow it down
-            
-            # ptrs
-            state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
-            
-            if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                tl.store(state_G_ptrs, states_mod)
-            else:
-                tl.store(state_G_ptrs, states_mod, mask=main_mask)
-            # let the next one go
-            tl.atomic_add(sync_atomic, 1, sem='release')
-
-            sync_atomic += stride_sync_dstate
-
-
-        ########################################
-        # Chunk Scan
-        ########################################
-        # pids same for all 3 parts
-        # all pids represent domain parallelism except pid_c for state passing
-        cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS_outer)
-
-        if HAS_SEQ_IDX:
-            seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
-        if HAS_Z:
-            out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
-            if not HAS_LAYERNORM:
-                z_ptr += pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
-
-        for pid_cs in range(0, cs_num_pid_cs, 1):
-            offs_cs = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
-            if not NEED_MASK_CS_CS_outer:
-                dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize).to(tl.float32)
-            else:
-                dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize, mask=offs_cs < chunk_size, other=0.0).to(tl.float32)
-            chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-            if HAS_SEQ_IDX:
-                seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
-                seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
-            acc = tl.zeros((CS_BLOCK_SIZE_CS_outer, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty)
-
-            # Without the if (pid_c > -1), with Triton 2.1.0, I get
-            # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
-            # With Triton 2.2.0, this works
-            if IS_TRITON_22 or pid_c > -1:
-                # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size CS_WHOLEBLOCK_DS
-                offs_k_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS else CS_BLOCK_SIZE_DS)
-                C_ptrs = C_ptr + (offs_cs[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate)
-                prev_states_ptrs = states_G_ptr + (offs_hd[None, :] * stride_states_G_hdim + offs_k_dstate[:, None] * stride_states_G_dstate)
-                if not HAS_SEQ_IDX:
-                    scale_m = tl.exp(dA_cs_m)
-                else:
-                    scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
-                if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
-                    if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
-                        C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
-                        prev_states = tl.load(prev_states_ptrs)
+                # chunk state chunk_size loop
+                acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
+                for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
+                    if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                        x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                        b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
                     else:
-                        C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
-                        prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim), other=0.0)
-                    prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                    acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(acc.dtype)
+                        x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                        b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
+                    dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
+                    if HAS_SEQ_IDX:
+                        seq_idx_k = tl.load(seq_idx_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=-1)
+                    dt_k = tl.load(dt_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
+                    if not HAS_SEQ_IDX:
+                        scale = tl.exp((dA_cs_last - dA_cs_k)) * dt_k
+                    else:
+                        scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
+                    b *= (scale[:, None]).to(x_ptr.dtype.element_ty)
+                    acc += tl.dot(x, b, out_dtype=acc.dtype)
+                    x_ptrs_cs += BLOCK_SIZE_CS * stride_x_seqlen
+                    b_ptrs_cs += BLOCK_SIZE_CS * stride_b_seqlen
+                    dt_ptrs_cs += BLOCK_SIZE_CS * stride_dt_csize
+                    dA_cumsum_ptrs_cs += BLOCK_SIZE_CS * stride_dA_cs_csize
+                    if HAS_SEQ_IDX:
+                        seq_idx_ptrs_cs += BLOCK_SIZE_CS * stride_seq_idx_seqlen
+                states = acc
+
+
+
+            ########################################
+            # State Passing
+            ########################################
+                state_G_ptrs = states_G_ptr + offs_hd[:, None] * stride_states_G_hdim + offs_ds[None, :] * stride_states_G_dstate
+
+                main_mask = None if ((not NEED_MASK_HD) and (not NEED_MASK_1_DS)) else (offs_hd < hdim)[:, None] & (offs_ds < dstate)[None, :]
+
+                # offset gets us to the end of each chunk
+                dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
+                scale = tl.exp(dA_cs)
+                if HAS_SEQ_IDX:
+                    # TODO: need atomics here?
+                    seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+                    seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+                    scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+                # sync
+                # the atomic represents which pid_c is ready
+                # therefore, wait for it to reach our pid_c
+                sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+                while sync_val < pid_c:
+                    sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
+
+                # need to load states from previous one (but already offset by 1 so no offset)
+                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                    states_prev = tl.load(state_G_ptrs)
                 else:
-                    for k in range(0, dstate, CS_BLOCK_SIZE_DS):
+                    states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+
+                states_mod = scale * states_prev + states # NOTE: scale.to(tl.float16) seems to slow it down
+                
+                # ptrs
+                state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
+                
+                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                    tl.store(state_G_ptrs, states_mod)
+                else:
+                    tl.store(state_G_ptrs, states_mod, mask=main_mask)
+                # let the next one go
+                tl.atomic_add(sync_atomic, 1, sem='release')
+
+                sync_atomic += stride_sync_dstate
+
+
+            ########################################
+            # Chunk Scan
+            ########################################
+            # pids same for all 3 parts
+            # all pids represent domain parallelism except pid_c for state passing
+            cs_num_pid_cs = tl.cdiv(chunk_size, CS_BLOCK_SIZE_CS_outer)
+
+            if HAS_SEQ_IDX:
+                seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+            if HAS_Z:
+                out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
+                if not HAS_LAYERNORM:
+                    z_ptr += pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
+
+            for pid_cs in range(0, cs_num_pid_cs, 1):
+                offs_cs = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
+                if not NEED_MASK_CS_CS_outer:
+                    dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize).to(tl.float32)
+                else:
+                    dA_cs_m = tl.load(dA_cumsum_ptr + offs_cs * stride_dA_cs_csize, mask=offs_cs < chunk_size, other=0.0).to(tl.float32)
+                chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+                if HAS_SEQ_IDX:
+                    seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
+                    seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
+                acc = tl.zeros((CS_BLOCK_SIZE_CS_outer, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty)
+
+                # Without the if (pid_c > -1), with Triton 2.1.0, I get
+                # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
+                # With Triton 2.2.0, this works
+                if IS_TRITON_22 or pid_c > -1:
+                    # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size CS_WHOLEBLOCK_DS
+                    offs_k_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS else CS_BLOCK_SIZE_DS)
+                    C_ptrs = C_ptr + (offs_cs[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate)
+                    prev_states_ptrs = states_G_ptr + (offs_hd[None, :] * stride_states_G_hdim + offs_k_dstate[:, None] * stride_states_G_dstate)
+                    if not HAS_SEQ_IDX:
+                        scale_m = tl.exp(dA_cs_m)
+                    else:
+                        scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
+                    if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
                         if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
                             C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
                             prev_states = tl.load(prev_states_ptrs)
                         else:
-                            C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
-                            prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_hd[None, :] < hdim), other=0.0)
+                            C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)
+                            prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim), other=0.0)
                         prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                        acc += tl.dot(C, prev_states, out_dtype=acc.dtype)
-                        C_ptrs += CS_BLOCK_SIZE_DS
-                        prev_states_ptrs += CS_BLOCK_SIZE_DS
-                    acc *= (scale_m[:, None]).to(acc.dtype)
+                        acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(acc.dtype)
+                    else:
+                        for k in range(0, dstate, CS_BLOCK_SIZE_DS):
+                            if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
+                                C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
+                                prev_states = tl.load(prev_states_ptrs)
+                            else:
+                                C = tl.load(C_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate - k), other=0.0)
+                                prev_states = tl.load(prev_states_ptrs, mask=(offs_k_dstate[:, None] < dstate - k) & (offs_hd[None, :] < hdim), other=0.0)
+                            prev_states = prev_states.to(C_ptr.dtype.element_ty)
+                            acc += tl.dot(C, prev_states, out_dtype=acc.dtype)
+                            C_ptrs += CS_BLOCK_SIZE_DS
+                            prev_states_ptrs += CS_BLOCK_SIZE_DS
+                        acc *= (scale_m[:, None]).to(acc.dtype)
 
-            offs_k = tl.arange(0, CS_BLOCK_SIZE_CS_inner)
-            cb_ptrs = cb_ptr + (offs_cs[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
-            x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim)
-            dt_ptrs = dt_ptr + offs_k * stride_dt_csize
-            dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
-            K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS_outer, chunk_size_limit)
-            for k in range(0, K_MAX, CS_BLOCK_SIZE_CS_inner):
-                # NOTE: CB, dA, and dt (dt_out) are always allocated in chunks, it's always fine to read beyond seqlen within a chunk
-                if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):
-                    cb = tl.load(cb_ptrs, eviction_policy='evict_last')
-                    dA_cs_k = tl.load(dA_cumsum_ptrs).to(tl.float32)
-                    dt_k = tl.load(dt_ptrs).to(acc.dtype)
-                else:
-                    cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
-                    dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
-                    dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
-                # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
-                # So we don't need masking wrt seq_idx here.
-                cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
-                cb *= dt_k
-                if not NEED_MASK_HD:
-                    x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_last')
-                else:
-                    x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
-                if IS_CAUSAL:
-                    mask = offs_cs[:, None] >= k + offs_k[None, :]
-                    cb = tl.where(mask, cb, 0.0)
-                acc += tl.dot(cb, x, out_dtype=acc.dtype)
-                cb_ptrs += CS_BLOCK_SIZE_CS_inner * stride_cb_csize_k
-                x_ptrs += CS_BLOCK_SIZE_CS_inner * stride_x_seqlen
-                dt_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dt_csize
-                dA_cumsum_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dA_cs_csize
+                offs_k = tl.arange(0, CS_BLOCK_SIZE_CS_inner)
+                cb_ptrs = cb_ptr + (offs_cs[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
+                x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim)
+                dt_ptrs = dt_ptr + offs_k * stride_dt_csize
+                dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
+                K_MAX = chunk_size_limit if not IS_CAUSAL else min((pid_cs + 1) * CS_BLOCK_SIZE_CS_outer, chunk_size_limit)
+                for k in range(0, K_MAX, CS_BLOCK_SIZE_CS_inner):
+                    # NOTE: CB, dA, and dt (dt_out) are always allocated in chunks, it's always fine to read beyond seqlen within a chunk
+                    if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):
+                        cb = tl.load(cb_ptrs, eviction_policy='evict_last')
+                        dA_cs_k = tl.load(dA_cumsum_ptrs).to(tl.float32)
+                        dt_k = tl.load(dt_ptrs).to(acc.dtype)
+                    else:
+                        cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
+                        dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
+                        dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
+                    # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
+                    # So we don't need masking wrt seq_idx here.
+                    cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
+                    cb *= dt_k
+                    if not NEED_MASK_HD:
+                        x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_last')
+                    else:
+                        x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_last')
+                    if IS_CAUSAL:
+                        mask = offs_cs[:, None] >= k + offs_k[None, :]
+                        cb = tl.where(mask, cb, 0.0)
+                    acc += tl.dot(cb, x, out_dtype=acc.dtype)
+                    cb_ptrs += CS_BLOCK_SIZE_CS_inner * stride_cb_csize_k
+                    x_ptrs += CS_BLOCK_SIZE_CS_inner * stride_x_seqlen
+                    dt_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dt_csize
+                    dA_cumsum_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dA_cs_csize
 
-            if HAS_D:
-                if D_HAS_HDIM:
-                    D = tl.load(D_ptr + pid_h * stride_D_head + offs_hd, mask=offs_hd < hdim, other=0.0)
-                else:
-                    D = tl.load(D_ptr + pid_h * stride_D_head)
-                if not NEED_MASK_HD:
-                    x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
-                                        mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
-                else:
-                    x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
-                                        mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0)
-                acc += x_residual * D
+                if HAS_D:
+                    if D_HAS_HDIM:
+                        D = tl.load(D_ptr + pid_h * stride_D_head + offs_hd, mask=offs_hd < hdim, other=0.0)
+                    else:
+                        D = tl.load(D_ptr + pid_h * stride_D_head)
+                    if not NEED_MASK_HD:
+                        x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
+                                            mask=(offs_cs[:, None] < chunk_size_limit), other=0.0)
+                    else:
+                        x_residual = tl.load(x_ptr + (offs_cs[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim),
+                                            mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0)
+                    acc += x_residual * D
 
-            if HAS_Z and not HAS_LAYERNORM:
-                out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :])
-                tl.store(out_x_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim))
+                if HAS_Z and not HAS_LAYERNORM:
+                    out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :])
+                    tl.store(out_x_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim))
 
-                z_ptrs = z_ptr + (stride_z_seqlen * offs_cs[:, None] + stride_z_hdim * offs_hd[None, :])
-                z = tl.load(z_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0).to(tl.float32)
-                acc *= z * tl.sigmoid(z)
+                    z_ptrs = z_ptr + (stride_z_seqlen * offs_cs[:, None] + stride_z_hdim * offs_hd[None, :])
+                    z = tl.load(z_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0).to(tl.float32)
+                    acc *= z * tl.sigmoid(z)
 
-            # write to either final output or x
-            out_ptr_cs = out_x_ptr if HAS_LAYERNORM else out_ptr
-            out_ptrs = out_ptr_cs + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
-            tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_first')
-        # mark batch, chunk, head, hdim as ready for layernorm
-        # batch * nchunks * nheads * num_pid_hd
-        if HAS_LAYERNORM:
-            tl.atomic_add(layernorm_wait_ptr + pid_b * layernorm_wait_stride_batch + pid_c * layernorm_wait_stride_chunk, BLOCK_SIZE_HD)
-    elif HAS_LAYERNORM:
-        pid_layernorm = pid_og - (num_pids_bmm + num_pids_css + num_pids_fused3)
-        n_subc = tl.cdiv(chunk_size, LAYERNORM_TB_SEQ)
-        pid_subc = pid_layernorm % n_subc
-        pid_c = (pid_layernorm // n_subc) % nchunks
-        pid_b = (pid_layernorm // (n_subc * nchunks))
-        # await data
-        layernorm_wait_ptr += pid_b * layernorm_wait_stride_batch + pid_c * layernorm_wait_stride_chunk
-        wait_val = tl.atomic_add(layernorm_wait_ptr, 0)
-        wait_target = nheads * hdim
-        while wait_val < wait_target:
+                # write to either final output or x
+                out_ptr_cs = out_x_ptr if HAS_LAYERNORM else out_ptr
+                out_ptrs = out_ptr_cs + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
+                tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_last')
+            # mark batch, chunk, head, hdim as ready for layernorm
+            # batch * nchunks * nheads * num_pid_hd
+            if HAS_LAYERNORM:
+                tl.atomic_add(layernorm_wait_ptr + pid_b * layernorm_wait_stride_batch + pid_c * layernorm_wait_stride_chunk, BLOCK_SIZE_HD)
+        elif HAS_LAYERNORM:
+            # pid_layernorm = pid_og - (num_pids_bmm + num_pids_css + num_pids_fused3)
+            pid_group = pid_ln % ngroups # TODO: support ngroups on multiple devices
+            pid_subc = pid_ln // ngroups
+            # await data
+            layernorm_wait_ptr += pid_b * layernorm_wait_stride_batch + pid_c * layernorm_wait_stride_chunk
             wait_val = tl.atomic_add(layernorm_wait_ptr, 0)
+            wait_target = nheads * hdim
+            while wait_val < wait_target:
+                wait_val = tl.atomic_add(layernorm_wait_ptr, 0)
 
-        seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
-        X = out_x_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
-        Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
-        Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
-        chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-        tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
-        for i in range(pid_subc * LAYERNORM_TB_SEQ, tb_chunk_end, LAYERNORM_SEQ_BLOCK):
-            # TODO: make sure heads contiguous?
-            dim = nheads * hdim # TODO: allow non-pwr2
-            # Map the program id to the row of X and Y it should compute.
-            # Compute mean and variance
-            rows = tl.arange(0, LAYERNORM_SEQ_BLOCK)
-            cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
-            mask=(cols < dim)[None, :] & (rows < tb_chunk_end)[:, None]
-            # TODO: don't assumb contiguous
-            x_ptrs = X + rows[:, None] * dim + cols[None, :]
-            x = tl.load(x_ptrs, mask=mask, other=0.).to(tl.float32)
-            xbar = tl.where(cols < dim, x, 0.)
-            var = tl.sum(xbar * xbar, axis=1) / dim
-            rstd = 1 / tl.sqrt(var + rmsnorm_eps)
-            tl.store(rstd_ptr + pid_b * seqlen + pid_c * chunk_size + i + rows, rstd, mask=rows < tb_chunk_end)
-            # Normalize and apply linear transformation
-            w = tl.load(rmsnorm_weight + cols, mask=cols < dim).to(tl.float32)
-            x_hat = x * rstd[:, None]
-            y = x_hat * w
-            z_ptrs = Z + rows[:, None] * dim + cols[None, :]
-            z = tl.load(z_ptrs, mask=mask).to(tl.float32)
-            y *= z * tl.sigmoid(z)
-            # Write output
-            y_ptrs = Y + rows[:, None] * dim + cols[None, :]
-            tl.store(y_ptrs, y, mask=mask)
-            # move within chunk along seqlen
-            X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
-            Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
-            Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
+            seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
+            X = out_x_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+            Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+            Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
+            chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+            tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
+            for i in range(pid_subc * LAYERNORM_TB_SEQ, tb_chunk_end, LAYERNORM_SEQ_BLOCK):
+                # TODO: make sure heads contiguous?
+                dim = nheads // ngroups * hdim # TODO: allow non-pwr2
+                # Map the program id to the row of X and Y it should compute.
+                # Compute mean and variance
+                rows = tl.arange(0, LAYERNORM_SEQ_BLOCK)
+                cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
+                mask=(cols < dim)[None, :] & (rows < tb_chunk_end)[:, None]
+                if HAS_Z:
+                    z_ptrs = Z + rows[:, None] * dim * ngroups + pid_group * dim + cols[None, :]
+                # TODO: don't assumb contiguous
+                x_ptrs = X + rows[:, None] * dim * ngroups + pid_group * dim + cols[None, :]
+                x = tl.load(x_ptrs, mask=mask, other=0., eviction_policy='evict_first').to(tl.float32)
+                if HAS_Z and not NORM_BEFORE_GATE:
+                    z = tl.load(z_ptrs, mask=mask).to(tl.float32)
+                    x *= z * tl.sigmoid(z)
+                # if not IS_RMS_NORM:
+                #     mean = tl.sum(x, axis=0) / N
+                #     tl.store(Mean + row, mean)
+                #     xbar = tl.where(cols < N, x - mean, 0.)
+                #     var = tl.sum(xbar * xbar, axis=0) / N
+                # else:
+                xbar = tl.where(cols < dim, x, 0.)
+                var = tl.sum(xbar * xbar, axis=1) / dim
+
+                rstd = 1 / tl.sqrt(var + rmsnorm_eps)
+                # if not IS_RMS_NORM:
+                #     Mean += group * M
+                tl.store(rstd_ptr + pid_group * batch * seqlen + pid_b * seqlen + pid_c * chunk_size + i + rows, rstd, mask=rows < tb_chunk_end)
+                # Normalize and apply linear transformation
+                w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim, eviction_policy='evict_last').to(tl.float32)
+                # if HAS_BIAS:
+                #     B += group * N
+                #     b = tl.load(B + cols, mask=mask).to(tl.float32)
+                # x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
+                # y = x_hat * w + b if HAS_BIAS else x_hat * w
+                x_hat = x * rstd[:, None]
+                y = x_hat * w
+                if HAS_Z and NORM_BEFORE_GATE:
+                    z = tl.load(z_ptrs, mask=mask, eviction_policy='evict_first').to(tl.float32)
+                    y *= z * tl.sigmoid(z)
+                # Write output
+                y_ptrs = Y + rows[:, None] * dim * ngroups + pid_group * dim + cols[None, :]
+                tl.store(y_ptrs, y, mask=mask, eviction_policy='evict_first')
+                # move within chunk along seqlen
+                X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+                Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+                if HAS_Z:
+                    Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
 
 def _fused5_ssd(
     x, dt, A, B, C, D,
     chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False, out_dtype=torch.float16,
     use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
-    norm_before_gate=False, rmsnorm_weight=None, rmsnorm_eps=1e-6,
+    use_fused6_norm=False, norm_before_gate=False, rmsnorm_weight=None, rmsnorm_eps=1e-6,
 ):
     """
     Runs the Mamba2 SSD with 1 large fused kernel instead of the 5 original kernels,
@@ -631,7 +661,7 @@ def _fused5_ssd(
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                   if z is not None else (0, 0, 0, 0))
     # layernorm
-    if norm_before_gate:
+    if use_fused6_norm:
         M = batch * seqlen
         N = nheads * hdim
         group_size = None # TODO: parameter
@@ -659,8 +689,8 @@ def _fused5_ssd(
         # fused3 grid
         batch * nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD']) +
         # layernorm grid
-        (0 if not norm_before_gate else batch * nchunks * triton.cdiv(chunk_size, META['LAYERNORM_TB_SEQ']))
-    ,)
+        (0 if not use_fused6_norm else batch * nchunks * ngroups * triton.cdiv(chunk_size, META['LAYERNORM_TB_SEQ']))
+    ,) # TODO: test layernorm ngroups
 
     # for some reason, it's far faster to do this outside of the kernel
     # this probably reduces register pressure and instructions a lot
@@ -723,10 +753,11 @@ def _fused5_ssd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
-        BLOCK_SIZE_LAYERNORM=triton.next_power_of_2(nheads * hdim),
+        BLOCK_SIZE_LAYERNORM=triton.next_power_of_2(nheads // ngroups * hdim),
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,
-        HAS_LAYERNORM=norm_before_gate,
+        HAS_LAYERNORM=use_fused6_norm,
+        NORM_BEFORE_GATE=norm_before_gate,
     )
 
     # states_G holds both states and final states

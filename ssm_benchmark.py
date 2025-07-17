@@ -29,13 +29,13 @@ from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, rmsnorm_weight, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     batch, seqlen, nheads, hdim = x.shape
 
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, None, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, fused5_norm_before_gate=False, use_fused5_ssd=False)
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, None, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused6_norm=False, fused5_norm_before_gate=False, use_fused5_ssd=False)
     if HAS_LAYERNORM_GATED:
         x_out = outputs[0]
         x_rms = rearrange(x_out, "b s h p -> (b s) (h p)")
         z_rms = rearrange(z, "b s h p -> (b s) (h p)")
         dim = nheads * hdim
-        output_gated, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, 1e-6, z_rms, out=None, group_size=dim // ngroups, norm_before_gate=True, is_rms_norm=True)
+        output_gated, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, 1e-6, z_rms, out=None, group_size=dim // ngroups, norm_before_gate=False, is_rms_norm=True)
         output_gated = rearrange(output_gated, "(b s) (h p) -> b s h p", b=batch, s=seqlen, h=nheads)
         return output_gated, *outputs[1:], rstd
     else:
@@ -52,7 +52,7 @@ def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, rmsnorm_weight, dt_bias, ini
         rmsnorm_weight_fused = None
         z_fused = None
         fuse_layernorm = False
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z_fused, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True, fused5_norm_before_gate=fuse_layernorm, fused5_rmsnorm_weight=rmsnorm_weight_fused, fused5_rmsnorm_eps=1e-6)
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z_fused, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True, use_fused6_norm=fuse_layernorm, fused5_norm_before_gate=False, fused5_rmsnorm_weight=rmsnorm_weight_fused, fused5_rmsnorm_eps=1e-6)
 
     # layernorm not fused
     if HAS_LAYERNORM_GATED and not FUSED_LAYERNORM:
@@ -60,7 +60,7 @@ def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, rmsnorm_weight, dt_bias, ini
         x_rms = rearrange(x_out, "b s h p -> (b s) (h p)")
         z_rms = rearrange(z, "b s h p -> (b s) (h p)")
         dim = nheads * hdim
-        output_gated, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, 1e-6, z_rms, out=None, group_size=dim // ngroups, norm_before_gate=True, is_rms_norm=True)
+        output_gated, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, 1e-6, z_rms, out=None, group_size=dim // ngroups, norm_before_gate=False, is_rms_norm=True)
         output_gated = rearrange(output_gated, "(b s) (h p) -> b s h p", b=batch, s=seqlen, h=nheads)
         return output_gated, *outputs[1:], rstd
     else:

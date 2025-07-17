@@ -25,7 +25,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
             # layernorm seqlen per threadblock (<= chunk_size)
-            'LAYERNORM_TB_SEQ': 8, 'LAYERNORM_SEQ_BLOCK': 1,
+            'LAYERNORM_TB_SEQ': 8, 'LAYERNORM_SEQ_BLOCK': 1, 'BLOCK_SIZE_LAYERNORM': 2048
             }, num_stages=1, num_warps=4, maxnreg=128),
         # Use this for autotuning, it makes hundreds of configs though
         # You can also try other block size values not in the lists below
@@ -57,7 +57,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
     'NEED_MASK_CS_CS_inner': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS_inner'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS_inner'],
     'NEED_MASK_CS_CS_outer': lambda args: args['chunk_size'] / args['CS_BLOCK_SIZE_CS_outer'] != args['chunk_size'] // args['CS_BLOCK_SIZE_CS_outer'],
     'NEED_MASK_1_DS': lambda args: args['dstate'] / args['BLOCK_SIZE_DS'] != args['dstate'] // args['BLOCK_SIZE_DS'],
-    'NEED_MASK_LN_DIM': lambda args: args['BLOCK_SIZE_LAYERNORM'] != (args['nheads'] // args['ngroups'] * args['hdim']),
+    # 'NEED_MASK_LN_DIM': lambda args: args['BLOCK_SIZE_LAYERNORM'] != (args['nheads'] // args['ngroups'] * args['hdim']),
 })
 @triton.jit
 def _fused5_ssd_kernel(
@@ -98,13 +98,12 @@ def _fused5_ssd_kernel(
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
     BMM_BLOCK_SIZE_M: tl.constexpr, BMM_BLOCK_SIZE_N: tl.constexpr, BMM_BLOCK_SIZE_K: tl.constexpr,
     CCS_BLOCK_SIZE_H: tl.constexpr,
-    LAYERNORM_TB_SEQ: tl.constexpr, LAYERNORM_SEQ_BLOCK: tl.constexpr,
+    LAYERNORM_TB_SEQ: tl.constexpr, LAYERNORM_SEQ_BLOCK: tl.constexpr, BLOCK_SIZE_LAYERNORM: tl.constexpr,
     # pwr2 dim constexprs
     BLOCK_SIZE_DSTATE: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
-    BLOCK_SIZE_LAYERNORM: tl.constexpr,
     # Heuristic mask bools
     NEED_MASK_HD: tl.constexpr, NEED_MASK_CS_DS: tl.constexpr, NEED_MASK_CS_CS_outer: tl.constexpr,
-    NEED_MASK_CS_CS_inner: tl.constexpr, NEED_MASK_1_DS: tl.constexpr, NEED_MASK_LN_DIM: tl.constexpr,
+    NEED_MASK_CS_CS_inner: tl.constexpr, NEED_MASK_1_DS: tl.constexpr, #NEED_MASK_LN_DIM: tl.constexpr,
 ):
     """
     This fused Mamba2 SSD kernel combines the 5 original SSD kernels.
@@ -565,7 +564,7 @@ def _fused5_ssd_kernel(
 
             seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
             X = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
-            # Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+            Y = out_x_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
             Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
             tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
@@ -574,52 +573,49 @@ def _fused5_ssd_kernel(
                 dim = nheads // ngroups * hdim # TODO: allow non-pwr2
                 # Map the program id to the row of X and Y it should compute.
                 # Compute mean and variance
-                # rows = tl.arange(0, LAYERNORM_SEQ_BLOCK)
-                cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
-                if NEED_MASK_LN_DIM:
+                var = 0.#tl.zeros(1, dtype=tl.float32)
+                for offset_cols in tl.range(0, dim, BLOCK_SIZE_LAYERNORM, num_stages=1):
+                    cols = tl.arange(0, BLOCK_SIZE_LAYERNORM) + offset_cols
                     mask=(cols < dim)#[None, :]# & (rows < tb_chunk_end)[:, None]
-                else:
-                    mask=None#(rows < tb_chunk_end)[:, None]
-                if HAS_Z:
-                    z_ptrs = Z + pid_group * dim + cols#[None, :] # rows[:, None] * dim * ngroups + 
-                # TODO: don't assume contiguous
-                x_ptrs = X + pid_group * dim + cols#[None, :] # + rows[:, None] * dim * ngroups
-                x = tl.load(x_ptrs, mask=mask, other=0.)#.to(tl.float32) #, eviction_policy='evict_first'
-                if HAS_Z and not NORM_BEFORE_GATE:
-                    z = tl.load(z_ptrs, mask=mask).to(tl.float32) #, eviction_policy='evict_first'
-                    x *= (z * tl.sigmoid(z))#.to(tl.float16) # TODO: try to do float16 without nan
-                # if not IS_RMS_NORM:
-                #     mean = tl.sum(x, axis=0) / N
-                #     tl.store(Mean + row, mean)
-                #     xbar = tl.where(cols < N, x - mean, 0.)
-                #     var = tl.sum(xbar * xbar, axis=0) / N
-                # else:
-                xbar = tl.where(cols < dim, x, 0.)
-                var = tl.sum(xbar * xbar, axis=0) / dim #1) / dim
+                    if HAS_Z:
+                        z_ptrs = Z + pid_group * dim + cols#[None, :] # rows[:, None] * dim * ngroups + 
+                    # TODO: don't assume contiguous
+                    x_ptrs = X + pid_group * dim + cols#[None, :] # + rows[:, None] * dim * ngroups
+                    x = tl.load(x_ptrs, mask=mask, other=0.)#.to(tl.float32) #, eviction_policy='evict_first'
+                    if HAS_Z and not NORM_BEFORE_GATE:
+                        z = tl.load(z_ptrs, mask=mask).to(tl.float32) #, eviction_policy='evict_first'
+                        x *= (z * tl.sigmoid(z))#.to(tl.float16) # TODO: try to do float16 without nan
+                        y_ptrs = Y + pid_group * dim + cols#[None, :] # + rows[:, None] * dim * ngroups
+                        tl.store(y_ptrs, x, mask=mask, eviction_policy='evict_last')#, eviction_policy='evict_first')
+                    xbar = tl.where(cols < dim, x, 0.)
+                    var += tl.sum(xbar * xbar, axis=0) / dim #1) / dim
 
                 rstd = 1 / tl.sqrt(var + rmsnorm_eps)
-                # if not IS_RMS_NORM:
-                #     Mean += group * M
                 tl.store(rstd_ptr + pid_group * batch * seqlen + pid_b * seqlen + pid_c * chunk_size + i, rstd)# + rows, rstd, mask=rows < tb_chunk_end)
-                # Normalize and apply linear transformation
-                w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim if NEED_MASK_LN_DIM else None, eviction_policy='evict_last')#.to(tl.float32)
-                # if HAS_BIAS:
-                #     B += group * N
-                #     b = tl.load(B + cols, mask=mask).to(tl.float32)
-                # x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
-                # y = x_hat * w + b if HAS_BIAS else x_hat * w
-                x_hat = x * rstd#[:, None]
-                y = x_hat * w
-                if HAS_Z and NORM_BEFORE_GATE:
-                    z = tl.load(z_ptrs, mask=mask).to(tl.float32)#, eviction_policy='evict_first').to(tl.float32)
-                    y *= (z * tl.sigmoid(z)).to(tl.float16)
-                # Write output
-                # y_ptrs = Y + rows[:, None] * dim * ngroups + pid_group * dim + cols[None, :]
-                # store back in same place, probably better for cache
-                tl.store(x_ptrs, y, mask=mask, eviction_policy='evict_first')
+
+                for offset_cols in tl.range(0, dim, BLOCK_SIZE_LAYERNORM, num_stages=1):
+                    cols = tl.arange(0, BLOCK_SIZE_LAYERNORM) + offset_cols
+                    mask=(cols < dim)#[None, :]# & (rows < tb_chunk_end)[:, None]
+                    x_ptrs = X + pid_group * dim + cols#[None, :] # + rows[:, None] * dim * ngroups
+                    if HAS_Z and not NORM_BEFORE_GATE:
+                        y_ptrs = Y + pid_group * dim + cols#[None, :] # + rows[:, None] * dim * ngroups
+                        x = tl.load(y_ptrs, mask=mask, other=0., eviction_policy='evict_first')#.to(tl.float32) #, eviction_policy='evict_first'
+                    else:
+                        x = tl.load(x_ptrs, mask=mask, other=0.)#.to(tl.float32) #, eviction_policy='evict_first'
+                    # Normalize and apply linear transformation
+                    w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim, eviction_policy='evict_last')#.to(tl.float32)  if NEED_MASK_LN_DIM else None
+                    x_hat = x * rstd#[:, None]
+                    y = x_hat * w
+                    if HAS_Z and NORM_BEFORE_GATE:
+                        z = tl.load(z_ptrs, mask=mask).to(tl.float32)
+                        y *= (z * tl.sigmoid(z))#.to(tl.float16) # TODO: try to do float16 without nan
+                    # Write output
+                    # store back in same place, probably better for cache
+                    tl.store(x_ptrs, y, mask=mask, eviction_policy='evict_first')
+
                 # move within chunk along seqlen
                 X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
-                # Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+                Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
                 if HAS_Z:
                     Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
 
@@ -695,7 +691,8 @@ def _fused5_ssd(
     # Allocates output.
     out = torch.empty(batch, seqlen, nheads, hdim, device=x.device, dtype=x.dtype)
     if z is not None:
-        out_x = torch.empty(batch, seqlen, nheads, hdim, device=x.device, dtype=x.dtype)
+        # TODO: fix, cleanup, maybe use a different tensor
+        out_x = torch.empty(batch, seqlen, nheads, hdim, device=x.device, dtype=torch.float32)#x.dtype)
         assert out_x.stride() == out.stride()
     else:
         out_x = None
@@ -794,7 +791,6 @@ def _fused5_ssd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
-        BLOCK_SIZE_LAYERNORM=triton.next_power_of_2(nheads // ngroups * hdim),
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,
         HAS_LAYERNORM=use_fused6_norm,

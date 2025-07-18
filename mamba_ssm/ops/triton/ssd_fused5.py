@@ -25,7 +25,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
             # layernorm seqlen per threadblock (<= chunk_size)
-            'LAYERNORM_TB_SEQ': 8, 'LAYERNORM_SEQ_BLOCK': 1,
+            'LAYERNORM_TB_SEQ': 4, 'LAYERNORM_SEQ_BLOCK': 1,
             }, num_stages=1, num_warps=4, maxnreg=128),
         # Use this for autotuning, it makes hundreds of configs though
         # You can also try other block size values not in the lists below
@@ -266,7 +266,7 @@ def _fused5_ssd_kernel(
         num_layernorm_pids_per_bc = 0 if not HAS_LAYERNORM else ngroups * tl.cdiv(chunk_size, LAYERNORM_TB_SEQ)
         num_smaller_pids_combined = num_fused3_pids_per_bc + num_layernorm_pids_per_bc
 
-        pipeline_chunk_count = min(16, batch * nchunks) # TODO: don't hardcode
+        pipeline_chunk_count = min(8, batch * nchunks) # TODO: don't hardcode
         # to pipeline: at first, we only do fused3, then we interleave, then we do only layernorm
         first_pids_count = pipeline_chunk_count * num_fused3_pids_per_bc
         last_pids_count = pipeline_chunk_count * num_layernorm_pids_per_bc
@@ -545,12 +545,12 @@ def _fused5_ssd_kernel(
                     res = 0.1 * acc.to(tl.float32) * (z * tl.sigmoid(z)) # TODO: try to do fp16 without nan .to(tl.float16)
 
                     out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
-                    tl.store(out_ptrs, res, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_last')
+                    tl.store(out_ptrs, res, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), cache_modifier='.cg')
                 else:
                     # # write to either final output or x
                     # out_ptr_cs = out_x_ptr if HAS_LAYERNORM else out_ptr
                     out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
-                    tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_last')
+                    tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), cache_modifier='.cg')
             # mark batch, chunk, head, hdim as ready for layernorm
             # batch * nchunks * nheads * num_pid_hd
             if HAS_LAYERNORM:
@@ -569,28 +569,30 @@ def _fused5_ssd_kernel(
             seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
             X = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
             # Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
-            Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
+            if HAS_Z and NORM_BEFORE_GATE:
+                Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
             tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
+
+            dim = (nheads * hdim) // ngroups
+            cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
+            mask = (cols < dim) if NEED_MASK_LN_DIM else None
+            w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=mask, eviction_policy='evict_last').to(tl.float16)#.to(tl.float32)
             for i in tl.range(pid_subc * LAYERNORM_TB_SEQ, tb_chunk_end, LAYERNORM_SEQ_BLOCK, num_stages=1):
                 # TODO: make sure heads contiguous?
-                dim = (nheads * hdim) // ngroups
                 # Map the program id to the row of X and Y it should compute.
                 # Compute mean and variance
-                cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
-                mask = (cols < dim) if NEED_MASK_LN_DIM else None
-                if HAS_Z:
+                if HAS_Z and NORM_BEFORE_GATE:
                     z_ptrs = Z + pid_group * dim + cols
                 # TODO: don't assume contiguous
                 x_ptrs = X + pid_group * dim + cols
-                x = tl.load(x_ptrs, mask=mask, other=0. if NEED_MASK_LN_DIM else None, eviction_policy='evict_first').to(tl.float16)#.to(tl.float32) #, eviction_policy='evict_first'
+                x = tl.load(x_ptrs, mask=mask, other=0. if NEED_MASK_LN_DIM else None, cache_modifier='.cg').to(tl.float16)#.to(tl.float32) #, eviction_policy='evict_first'
                 xbar = tl.where(cols < dim, x.to(tl.float32), 0.)
                 var = tl.sum(xbar * xbar, axis=0) / dim
 
                 rstd = 1 / tl.sqrt(var + rmsnorm_eps)
                 tl.store(rstd_ptr + pid_group * batch * seqlen + pid_b * seqlen + pid_c * chunk_size + i, rstd / 10)
                 # Normalize and apply linear transformation
-                w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim if NEED_MASK_LN_DIM else None, eviction_policy='evict_last').to(tl.float16)#.to(tl.float32)
                 y = x * (rstd.to(tl.float16) * w)
                 if HAS_Z and NORM_BEFORE_GATE:
                     z = tl.load(z_ptrs, mask=mask).to(tl.float32)#, eviction_policy='evict_first').to(tl.float32)
@@ -602,7 +604,7 @@ def _fused5_ssd_kernel(
                 # move within chunk along seqlen
                 X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
                 # Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
-                if HAS_Z:
+                if HAS_Z and NORM_BEFORE_GATE:
                     Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
 
 def _fused5_ssd(

@@ -251,6 +251,10 @@ def _fused5_ssd_kernel(
     pid_c = (pid_fused3 // (nheads)) % nchunks
     pid_b = (pid_fused3 // (nheads * nchunks)) % batch
     pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
+    # pid_h = pid_fused3 % nheads
+    # pid_hd = (pid_fused3 // (nheads)) % num_pid_hd
+    # pid_c = (pid_fused3 // (nheads * num_pid_hd)) % nchunks
+    # pid_b = (pid_fused3 // (nheads * num_pid_hd * nchunks)) % batch
 
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
@@ -363,9 +367,9 @@ def _fused5_ssd_kernel(
         state_G_ptrs += stride_states_G_chunk # offset since 0 gets initial states
         
         if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-            tl.store(state_G_ptrs, states_mod)
+            tl.store(state_G_ptrs, states_mod)#, cache_modifier='.cs')
         else:
-            tl.store(state_G_ptrs, states_mod, mask=main_mask)
+            tl.store(state_G_ptrs, states_mod, mask=main_mask)#, cache_modifier='.cs')
         # let the next one go
         tl.atomic_add(sync_atomic, 1, sem='release')
 
@@ -486,8 +490,9 @@ def _fused5_ssd_kernel(
             z = tl.load(z_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0).to(tl.float32)
             acc *= z * tl.sigmoid(z)
 
+        # TODO: try overwriting x, but difficult because D or something causing nan, make parameter or something to set if we overwrite x, warn mutated
         out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
-        tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_first')
+        tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_first')# cache_modifier='.wt')
 
 
 def _fused5_ssd(
@@ -559,6 +564,8 @@ def _fused5_ssd(
     if D is not None:
         assert D.shape == (nheads, hdim) or D.shape == (nheads,)
     # Allocates output.
+    # TODO: make parameter or something, warn mutated
+    # out = x
     out = torch.empty(batch, seqlen, nheads, hdim, device=x.device, dtype=x.dtype)
     if z is not None:
         out_x = torch.empty(batch, seqlen, nheads, hdim, device=x.device, dtype=x.dtype)
@@ -640,3 +647,4 @@ def _fused5_ssd(
     # states_G holds both states and final states
     # TODO: decide if it's ok that keeping a ref to final states will cause all states to take up VRAM
     return out, out_x, states_G[:, :nchunks], states_G[:, nchunks], dA_cumsum, dt_out
+    # return x, out_x, states_G[:, :nchunks], states_G[:, nchunks], dA_cumsum, dt_out

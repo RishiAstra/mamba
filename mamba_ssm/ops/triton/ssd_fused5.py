@@ -568,7 +568,7 @@ def _fused5_ssd_kernel(
 
             seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
             X = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
-            Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+            # Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
             Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
             tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
@@ -583,25 +583,25 @@ def _fused5_ssd_kernel(
                     z_ptrs = Z + pid_group * dim + cols
                 # TODO: don't assume contiguous
                 x_ptrs = X + pid_group * dim + cols
-                x = tl.load(x_ptrs, mask=mask, other=0. if NEED_MASK_LN_DIM else None, eviction_policy='evict_first').to(tl.float32) #, eviction_policy='evict_first'
-                xbar = tl.where(cols < dim, x, 0.)
+                x = tl.load(x_ptrs, mask=mask, other=0. if NEED_MASK_LN_DIM else None, eviction_policy='evict_first').to(tl.float16)#.to(tl.float32) #, eviction_policy='evict_first'
+                xbar = tl.where(cols < dim, x.to(tl.float32), 0.)
                 var = tl.sum(xbar * xbar, axis=0) / dim
 
                 rstd = 1 / tl.sqrt(var + rmsnorm_eps)
                 tl.store(rstd_ptr + pid_group * batch * seqlen + pid_b * seqlen + pid_c * chunk_size + i, rstd / 10)
                 # Normalize and apply linear transformation
-                w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim if NEED_MASK_LN_DIM else None, eviction_policy='evict_last')#.to(tl.float32)
-                y = x * (rstd * w)
+                w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim if NEED_MASK_LN_DIM else None, eviction_policy='evict_last').to(tl.float16)#.to(tl.float32)
+                y = x * (rstd.to(tl.float16) * w)
                 if HAS_Z and NORM_BEFORE_GATE:
                     z = tl.load(z_ptrs, mask=mask).to(tl.float32)#, eviction_policy='evict_first').to(tl.float32)
                     y *= (z * tl.sigmoid(z)).to(tl.float16)
                 # Write output
-                y_ptrs = Y + pid_group * dim + cols
+                # y_ptrs = Y + pid_group * dim + cols
                 # store back in same place, probably better for cache
-                tl.store(y_ptrs, y, mask=mask, eviction_policy='evict_first')
+                tl.store(x_ptrs, y, mask=mask, eviction_policy='evict_first')
                 # move within chunk along seqlen
                 X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
-                Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+                # Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
                 if HAS_Z:
                     Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
 

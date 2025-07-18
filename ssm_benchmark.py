@@ -182,10 +182,12 @@ def run_unit_test(seqlen):
     #         initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
     #         ) for thing in things_to_compare]
 
-    field_names = ["out", "out_x", "dt", "dA_cumsum", "states", "final_states", "rstd"]
+    field_names =   ["out",     "out_x",    "dt",       "dA_cumsum",    "states",   "final_states", "rstd"]
+    atols =         [2.5e-3,    2.5e-3,     2.5e-3,     2.5e-3,         2.5e-3,     2.5e-3,         0.0]
     for field_idx in range(len(outputs_full[0])):
         outputs_0 = outputs_full[0][field_idx]
         if outputs_0 is None: # skip None
+            print(f"Skipping field {field_names[field_idx]} because ref output is None")
             continue
         print(f"comparing field {field_names[field_idx]}")
         # for i in range(len(outputs_full)):
@@ -197,7 +199,7 @@ def run_unit_test(seqlen):
         for i in range(1, len(outputs_full), 1):
             outputs_i = outputs_full[i][field_idx]
             print(f"shape ref: {outputs_0.shape}, shape test: {outputs_i.shape}")
-            atol = 2.5e-3
+            atol = atols[field_idx]
             rtol = 1e-2
             outputs_i = outputs_i.to(outputs_0.dtype)
             if torch.allclose(outputs_i, outputs_0, atol=atol, rtol=rtol, equal_nan=True):

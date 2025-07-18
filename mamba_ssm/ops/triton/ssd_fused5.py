@@ -439,8 +439,7 @@ def _fused5_ssd_kernel(
                 seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
             if HAS_Z:
                 out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
-                if not HAS_LAYERNORM:
-                    z_ptr += pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
+                z_ptr += pid_b * stride_z_batch + pid_c * chunk_size * stride_z_seqlen + pid_h * stride_z_head
 
             for pid_cs in range(0, cs_num_pid_cs, 1):
                 offs_cs = pid_cs * CS_BLOCK_SIZE_CS_outer + tl.arange(0, CS_BLOCK_SIZE_CS_outer)
@@ -535,19 +534,23 @@ def _fused5_ssd_kernel(
                                             mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0)
                     acc += x_residual * D
 
-                if HAS_Z and not HAS_LAYERNORM: #(not HAS_LAYERNORM or not NORM_BEFORE_GATE):
+                if HAS_Z and (not HAS_LAYERNORM or not NORM_BEFORE_GATE): #not HAS_LAYERNORM: #
                     # TODO: write out_x if needed
                     # out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :])
                     # tl.store(out_x_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_first')
 
                     z_ptrs = z_ptr + (stride_z_seqlen * offs_cs[:, None] + stride_z_hdim * offs_hd[None, :])
-                    z = tl.load(z_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0).to(tl.float32)
-                    acc *= (z * tl.sigmoid(z))# TODO: try to do fp16 without nan .to(tl.float16)
+                    z = tl.load(z_ptrs, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), other=0.0, eviction_policy='evict_first').to(tl.float32)
+                    # TODO: don't multiply by hardcoded value. it seems to go out of range too high or something. Also need to change corresponding multiply above
+                    res = 0.1 * acc.to(tl.float32) * (z * tl.sigmoid(z)) # TODO: try to do fp16 without nan .to(tl.float16)
 
-                # # write to either final output or x
-                # out_ptr_cs = out_x_ptr if HAS_LAYERNORM else out_ptr
-                out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
-                tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_last')
+                    out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
+                    tl.store(out_ptrs, res, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_last')
+                else:
+                    # # write to either final output or x
+                    # out_ptr_cs = out_x_ptr if HAS_LAYERNORM else out_ptr
+                    out_ptrs = out_ptr + (stride_out_seqlen * offs_cs[:, None] + offs_hd[None, :] * stride_out_hdim)
+                    tl.store(out_ptrs, acc, mask=(offs_cs[:, None] < chunk_size_limit) & (offs_hd[None, :] < hdim), eviction_policy='evict_last')
             # mark batch, chunk, head, hdim as ready for layernorm
             # batch * nchunks * nheads * num_pid_hd
             if HAS_LAYERNORM:
@@ -565,61 +568,40 @@ def _fused5_ssd_kernel(
 
             seq_start = (pid_c * chunk_size + pid_subc * LAYERNORM_TB_SEQ)
             X = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
-            # Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
+            Y = out_ptr + pid_b * stride_out_batch + seq_start * stride_out_seqlen
             Z = z_ptr + pid_b * stride_z_batch + seq_start * stride_z_seqlen
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
             tb_chunk_end = min(chunk_size_limit, (pid_subc + 1) * LAYERNORM_TB_SEQ)
             for i in tl.range(pid_subc * LAYERNORM_TB_SEQ, tb_chunk_end, LAYERNORM_SEQ_BLOCK, num_stages=1):
                 # TODO: make sure heads contiguous?
-                dim = nheads // ngroups * hdim # TODO: allow non-pwr2
+                dim = (nheads * hdim) // ngroups
                 # Map the program id to the row of X and Y it should compute.
                 # Compute mean and variance
-                # rows = tl.arange(0, LAYERNORM_SEQ_BLOCK)
                 cols = tl.arange(0, BLOCK_SIZE_LAYERNORM)
-                if NEED_MASK_LN_DIM:
-                    mask=(cols < dim)#[None, :]# & (rows < tb_chunk_end)[:, None]
-                else:
-                    mask=None#(rows < tb_chunk_end)[:, None]
+                mask = (cols < dim) if NEED_MASK_LN_DIM else None
                 if HAS_Z:
-                    z_ptrs = Z + pid_group * dim + cols#[None, :] # rows[:, None] * dim * ngroups + 
+                    z_ptrs = Z + pid_group * dim + cols
                 # TODO: don't assume contiguous
-                x_ptrs = X + pid_group * dim + cols#[None, :] # + rows[:, None] * dim * ngroups
-                x = tl.load(x_ptrs, mask=mask, other=0.)#.to(tl.float32) #, eviction_policy='evict_first'
-                if HAS_Z and not NORM_BEFORE_GATE:
-                    z = tl.load(z_ptrs, mask=mask).to(tl.float32) #, eviction_policy='evict_first'
-                    x *= (z * tl.sigmoid(z))#.to(tl.float16) # TODO: try to do float16 without nan
-                # if not IS_RMS_NORM:
-                #     mean = tl.sum(x, axis=0) / N
-                #     tl.store(Mean + row, mean)
-                #     xbar = tl.where(cols < N, x - mean, 0.)
-                #     var = tl.sum(xbar * xbar, axis=0) / N
-                # else:
+                x_ptrs = X + pid_group * dim + cols
+                x = tl.load(x_ptrs, mask=mask, other=0. if NEED_MASK_LN_DIM else None, eviction_policy='evict_first').to(tl.float32) #, eviction_policy='evict_first'
                 xbar = tl.where(cols < dim, x, 0.)
-                var = tl.sum(xbar * xbar, axis=0) / dim #1) / dim
+                var = tl.sum(xbar * xbar, axis=0) / dim
 
                 rstd = 1 / tl.sqrt(var + rmsnorm_eps)
-                # if not IS_RMS_NORM:
-                #     Mean += group * M
-                tl.store(rstd_ptr + pid_group * batch * seqlen + pid_b * seqlen + pid_c * chunk_size + i, rstd)# + rows, rstd, mask=rows < tb_chunk_end)
+                tl.store(rstd_ptr + pid_group * batch * seqlen + pid_b * seqlen + pid_c * chunk_size + i, rstd / 10)
                 # Normalize and apply linear transformation
                 w = tl.load(rmsnorm_weight + cols + pid_group * dim, mask=cols < dim if NEED_MASK_LN_DIM else None, eviction_policy='evict_last')#.to(tl.float32)
-                # if HAS_BIAS:
-                #     B += group * N
-                #     b = tl.load(B + cols, mask=mask).to(tl.float32)
-                # x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
-                # y = x_hat * w + b if HAS_BIAS else x_hat * w
-                x_hat = x * rstd#[:, None]
-                y = x_hat * w
+                y = x * (rstd * w)
                 if HAS_Z and NORM_BEFORE_GATE:
                     z = tl.load(z_ptrs, mask=mask).to(tl.float32)#, eviction_policy='evict_first').to(tl.float32)
                     y *= (z * tl.sigmoid(z)).to(tl.float16)
                 # Write output
-                # y_ptrs = Y + rows[:, None] * dim * ngroups + pid_group * dim + cols[None, :]
+                y_ptrs = Y + pid_group * dim + cols
                 # store back in same place, probably better for cache
-                tl.store(x_ptrs, y, mask=mask, eviction_policy='evict_first')
+                tl.store(y_ptrs, y, mask=mask, eviction_policy='evict_first')
                 # move within chunk along seqlen
                 X += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
-                # Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
+                Y += stride_out_seqlen * LAYERNORM_SEQ_BLOCK
                 if HAS_Z:
                     Z += stride_z_seqlen * LAYERNORM_SEQ_BLOCK
 

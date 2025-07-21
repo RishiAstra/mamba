@@ -5,7 +5,11 @@ USE_GIVEN_TEST_TENSORS = False # real prompt data, loads from files
 if not CHECK_CORRECTNESS:
     USE_GIVEN_TEST_TENSORS = False
 
-BENCHMARK_REPEATS = 100
+BENCHMARK_REPEATS = 200
+
+CHUNK_SIZE_ORIGINAL=256
+CHUNK_SIZE_FUSED=64
+
 
 have_init_states    = False
 have_seq_idx        = False
@@ -22,10 +26,14 @@ import numpy as np
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=False)
+    if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     return outputs
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True)
+    if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     return outputs
 
 things_to_compare = [
@@ -123,16 +131,13 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
 
 def run_unit_test(seqlen):
     # raise Exception("Not implemented")
-    
-    CHUNK_SIZE=256
-
     outputs_full = []
 
     for i, thing in enumerate(things_to_compare):
         dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen), is_original=i==0)
 
         outputs_full.append(thing[0](
-            x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
+            x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if i == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
         ))
 
@@ -154,6 +159,7 @@ def run_unit_test(seqlen):
         # compare all to the first
         for i in range(1, len(outputs_full), 1):
             outputs_i = outputs_full[i][field_idx]
+            print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
             atol = 2.5e-3
             rtol = 1e-2
             outputs_i = outputs_i.to(outputs_0.dtype)
@@ -185,12 +191,11 @@ def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
 
     dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(dims_b_seq_nh_hd_ng_ds)
-    CHUNK_SIZE=256
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench( \
         lambda: things_to_compare[provider][0](
-            x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
+            x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if provider == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus), \
         rep=BENCHMARK_REPEATS, quantiles=quantiles
     )

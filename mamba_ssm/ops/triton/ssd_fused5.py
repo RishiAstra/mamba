@@ -9,16 +9,16 @@ from packaging import version
 
 from mamba_ssm.ops.triton.softplus import softplus
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
-
+MAX_CS_BLOCK = 64
 @triton.autotune(
     configs=[
         triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
             # head dim block for chunk state, state passing, and chunk scan
             'BLOCK_SIZE_HD': 64,
             # dstate and chunk_size blocks for chunk state and state passing
-            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
+            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': min(MAX_CS_BLOCK, 32),
             # chunk scan config
-            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_BLOCK_SIZE_CS_outer': min(MAX_CS_BLOCK, 64), 'CS_BLOCK_SIZE_CS_inner': min(MAX_CS_BLOCK, 64), 'CS_BLOCK_SIZE_DS': 64,
             'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
             # BMM config
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
@@ -140,6 +140,12 @@ def _fused5_ssd_kernel(
     stride_out_batch = stride_out_batch.to(tl.int64)
     stride_C_batch = stride_C_batch.to(tl.int64)
     stride_states_G_batch = stride_states_G_batch.to(tl.int64)
+    # for small chunk sizes, need:
+    stride_states_G_chunk = stride_states_G_chunk.to(tl.int64)
+    # other chunk-related strides:
+    # stride_dt_batch, stride_dt_chunk
+    # stride_dA_cs_batch, stride_dA_cs_chunk
+    # stride_cb_batch, stride_cb_chunk
 
     if USE_ATOMIC_PID:
         # order does not matter, just need previous threadblocks concurrently running or finished

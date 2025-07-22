@@ -266,7 +266,7 @@ def _fused5_ssd_kernel(
         num_layernorm_pids_per_bc = 0 if not HAS_LAYERNORM else ngroups * tl.cdiv(chunk_size, LAYERNORM_TB_SEQ)
         num_smaller_pids_combined = num_fused3_pids_per_bc + num_layernorm_pids_per_bc
 
-        pipeline_chunk_count = min(8, batch * nchunks) # TODO: don't hardcode
+        pipeline_chunk_count = min(6, batch * nchunks) # TODO: don't hardcode
         # to pipeline: at first, we only do fused3, then we interleave, then we do only layernorm
         first_pids_count = pipeline_chunk_count * num_fused3_pids_per_bc
         last_pids_count = pipeline_chunk_count * num_layernorm_pids_per_bc

@@ -18,7 +18,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # dstate and chunk_size blocks for chunk state and state passing
             'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
             # chunk scan config
-            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 32, 'CS_BLOCK_SIZE_DS': 64,
             'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
             # BMM config
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
@@ -304,10 +304,10 @@ def _fused5_ssd_kernel(
         acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
         for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
             if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, cache_modifier='.cg')
                 b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
             else:
-                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, cache_modifier='.cg')
                 b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
             dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
             if HAS_SEQ_IDX:

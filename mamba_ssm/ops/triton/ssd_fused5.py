@@ -59,29 +59,29 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 @triton.jit
 def _fused5_ssd_kernel(
     # Synchronization
-    first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk: tl.constexpr, grid_atomic, USE_ATOMIC_PID: tl.constexpr, sync_atomic,
-    stride_sync_batch, stride_sync_head: tl.constexpr, stride_sync_hdim: tl.constexpr, stride_sync_dstate: tl.constexpr,
+    first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk, grid_atomic, USE_ATOMIC_PID: tl.constexpr, sync_atomic,
+    stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
     # Tensor dimensions
     hdim: tl.constexpr, dstate: tl.constexpr, chunk_size: tl.constexpr, batch, seqlen, nheads_ngroups_ratio: tl.constexpr, nheads: tl.constexpr, nchunks, ngroups: tl.constexpr,
     # Tensor ptrs
     x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, cb_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
     # Tensor strides
-    stride_x_batch, stride_x_seqlen: tl.constexpr, stride_x_head: tl.constexpr, stride_x_hdim: tl.constexpr,
-    stride_b_batch, stride_b_seqlen: tl.constexpr, stride_b_head: tl.constexpr, stride_b_dstate: tl.constexpr,
-    stride_dt_batch, stride_dt_chunk: tl.constexpr, stride_dt_head: tl.constexpr, stride_dt_csize: tl.constexpr,
-    stride_dA_cs_batch, stride_dA_cs_chunk: tl.constexpr, stride_dA_cs_head: tl.constexpr, stride_dA_cs_csize: tl.constexpr,
-    stride_seq_idx_batch, stride_seq_idx_seqlen: tl.constexpr,
-    stride_states_G_batch, stride_states_G_chunk: tl.constexpr, stride_states_G_head: tl.constexpr, stride_states_G_hdim: tl.constexpr, stride_states_G_dstate: tl.constexpr,
-    stride_cb_batch, stride_cb_chunk: tl.constexpr, stride_cb_head: tl.constexpr, stride_cb_csize_m: tl.constexpr, stride_cb_csize_k: tl.constexpr,
-    stride_z_batch, stride_z_seqlen: tl.constexpr, stride_z_head: tl.constexpr, stride_z_hdim: tl.constexpr,
-    stride_out_batch, stride_out_seqlen: tl.constexpr, stride_out_head: tl.constexpr, stride_out_hdim: tl.constexpr,
-    stride_C_batch, stride_C_seqlen: tl.constexpr, stride_C_head: tl.constexpr, stride_C_dstate: tl.constexpr,
-    stride_D_head: tl.constexpr,
-    stride_dt_orig_batch, stride_dt_orig_seqlen: tl.constexpr, stride_dt_orig_head: tl.constexpr,
-    stride_A_head: tl.constexpr,
-    stride_dt_bias_head: tl.constexpr,
+    stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
+    stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
+    stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
+    stride_states_G_batch, stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
+    stride_cb_batch, stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_k,
+    stride_z_batch, stride_z_seqlen, stride_z_head, stride_z_hdim,
+    stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
+    stride_C_batch, stride_C_seqlen, stride_C_head, stride_C_dstate,
+    stride_D_head,
+    stride_dt_orig_batch, stride_dt_orig_seqlen, stride_dt_orig_head,
+    stride_A_head,
+    stride_dt_bias_head,
     # dt limits
-    dt_min: tl.constexpr, dt_max: tl.constexpr,
+    dt_min, dt_max,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr, HAS_D: tl.constexpr, D_HAS_HDIM: tl.constexpr, HAS_Z: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr,

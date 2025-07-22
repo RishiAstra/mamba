@@ -1,6 +1,9 @@
 # some code from https://triton-lang.org/main/getting-started/tutorials/...
 
-CHECK_CORRECTNESS = False
+HAS_LAYERNORM_GATED = True
+FUSED_LAYERNORM = True
+
+CHECK_CORRECTNESS = True
 USE_GIVEN_TEST_TENSORS = False # real prompt data, loads from files
 if not CHECK_CORRECTNESS:
     USE_GIVEN_TEST_TENSORS = False
@@ -10,7 +13,6 @@ BENCHMARK_REPEATS = 200
 CHUNK_SIZE_ORIGINAL=256
 CHUNK_SIZE_FUSED=128
 
-
 have_init_states    = False
 have_seq_idx        = False
 have_cu_seqlens     = False # TODO: test
@@ -18,22 +20,59 @@ have_dt_softplus    = True # TODO: test more
 
 
 import random
+from einops import rearrange
 import torch
 
 import triton
 import numpy as np
 
+from mamba_ssm.ops.triton.layernorm_gated import _layer_norm_fwd
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
-def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=False)
-    if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
-        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
-    return outputs
 
-def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True)
+def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, rmsnorm_weight, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+    batch, seqlen, nheads, hdim = x.shape
+
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, None, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused6_norm=False, fused5_norm_before_gate=False, use_fused5_ssd=False)
+    if HAS_LAYERNORM_GATED:
+        x_out = outputs[0]
+        x_rms = rearrange(x_out, "b s h p -> (b s) (h p)")
+        z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+        dim = nheads * hdim
+        output_gated, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, 1e-6, z_rms, out=None, group_size=dim // ngroups, norm_before_gate=False, is_rms_norm=True)
+        output_gated = rearrange(output_gated, "(b s) (h p) -> b s h p", b=batch, s=seqlen, h=nheads)
+        outputs = output_gated, *outputs[1:], rstd
+
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
-        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+        outputs = outputs[0], outputs[1], None, None, None, *outputs[5:]
+    
+    return outputs
+    
+def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, rmsnorm_weight, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+    batch, seqlen, nheads, hdim = x.shape
+
+    if HAS_LAYERNORM_GATED and FUSED_LAYERNORM:
+        rmsnorm_weight_fused = rmsnorm_weight
+        z_fused = z
+        fuse_layernorm = True
+    else:
+        rmsnorm_weight_fused = None
+        z_fused = None
+        fuse_layernorm = False
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z_fused, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True, use_fused6_norm=fuse_layernorm, fused5_norm_before_gate=False, fused5_rmsnorm_weight=rmsnorm_weight_fused, fused5_rmsnorm_eps=1e-6)
+
+    # layernorm not fused
+    if HAS_LAYERNORM_GATED and not FUSED_LAYERNORM:
+        x_out = outputs[0]
+        x_rms = rearrange(x_out, "b s h p -> (b s) (h p)")
+        z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+        dim = nheads * hdim
+        output_gated, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, 1e-6, z_rms, out=None, group_size=dim // ngroups, norm_before_gate=False, is_rms_norm=True)
+        output_gated = rearrange(output_gated, "(b s) (h p) -> b s h p", b=batch, s=seqlen, h=nheads)
+        outputs = output_gated, *outputs[1:], rstd
+    
+    if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+        outputs = outputs[0], outputs[1], None, None, None, *outputs[5:]
+    
     return outputs
 
 things_to_compare = [
@@ -89,6 +128,8 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
     C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 5 + 20
     D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.5 + 1.2
     x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 2 + 5
+    z = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 3
+    rmsnorm_weight = torch.randn((nheads * headdim,), dtype=torch.float16, device=DEVICE) * 3
 
     # NOTE: overrides the sizes
     if USE_GIVEN_TEST_TENSORS:
@@ -100,6 +141,7 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
         dt_bias =   torch.load(f"{dump_name}/dt_bias_in{counter}")
         dt =        torch.load(f"{dump_name}/dt_in{counter}")
         x =         torch.load(f"{dump_name}/x_in{counter}")
+        # TODO: support layernorm test with real values
 
     if have_init_states:
         initial_states = torch.randn((batch, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
@@ -126,18 +168,21 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
     else:
         seq_idx = None
 
-    return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, None #, cu_seqlens
+    return dt, dt_bias, A, B, C, D, x, z, rmsnorm_weight, initial_states, seq_idx, None #, cu_seqlens
 
 
 def run_unit_test(seqlen):
     # raise Exception("Not implemented")
+    
+    CHUNK_SIZE=256
+
     outputs_full = []
 
     for i, thing in enumerate(things_to_compare):
-        dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen), is_original=i==0)
+        dt, dt_bias, A, B, C, D, x, z, rmsnorm_weight, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen), is_original=i==0)
 
         outputs_full.append(thing[0](
-            x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if i == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
+            x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if i == 0 else CHUNK_SIZE_FUSED, D=D, z=z, rmsnorm_weight=rmsnorm_weight, dt_bias=dt_bias,
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
         ))
 
@@ -145,10 +190,13 @@ def run_unit_test(seqlen):
     #         x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
     #         initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
     #         ) for thing in things_to_compare]
-    field_names = ["out", "out_x", "dt", "dA_cumsum", "states", "final_states"]
+
+    field_names =   ["out",     "out_x",    "dt",       "dA_cumsum",    "states",   "final_states", "rstd"]
+    atols =         [2.5e-3,    2.5e-3,     2.5e-3,     2.5e-3,         2.5e-3,     2.5e-3,         0.0]
     for field_idx in range(len(outputs_full[0])):
         outputs_0 = outputs_full[0][field_idx]
         if outputs_0 is None: # skip None
+            print(f"Skipping field {field_names[field_idx]} because ref output is None")
             continue
         print(f"comparing field {field_names[field_idx]}")
         # for i in range(len(outputs_full)):
@@ -159,8 +207,8 @@ def run_unit_test(seqlen):
         # compare all to the first
         for i in range(1, len(outputs_full), 1):
             outputs_i = outputs_full[i][field_idx]
-            print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
-            atol = 2.5e-3
+            print(f"shape ref: {outputs_0.shape}, shape test: {outputs_i.shape}")
+            atol = atols[field_idx]
             rtol = 1e-2
             outputs_i = outputs_i.to(outputs_0.dtype)
             if torch.allclose(outputs_i, outputs_0, atol=atol, rtol=rtol, equal_nan=True):
@@ -190,12 +238,13 @@ def run_unit_test(seqlen):
 def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
 
-    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(dims_b_seq_nh_hd_ng_ds)
+    dt, dt_bias, A, B, C, D, x, z, rmsnorm_weight, initial_states, seq_idx, cu_seqlens = get_rand_input(dims_b_seq_nh_hd_ng_ds)
+    CHUNK_SIZE=256
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench( \
         lambda: things_to_compare[provider][0](
-            x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if provider == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
+            x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if provider == 0 else CHUNK_SIZE_FUSED, D=D, z=z, rmsnorm_weight=rmsnorm_weight, dt_bias=dt_bias,
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus), \
         rep=BENCHMARK_REPEATS, quantiles=quantiles
     )

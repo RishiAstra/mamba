@@ -248,9 +248,9 @@ def _fused5_ssd_kernel(
     num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
     num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     pid_h = pid_fused3 % nheads
-    pid_c = (pid_fused3 // (nheads)) % nchunks
-    pid_b = (pid_fused3 // (nheads * nchunks)) % batch
-    pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
+    pid_hd = (pid_fused3 // (nheads)) % num_pid_hd
+    pid_c = (pid_fused3 // (nheads * num_pid_hd)) % nchunks
+    pid_b = (pid_fused3 // (nheads * num_pid_hd * nchunks)) % batch
 
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
@@ -267,9 +267,6 @@ def _fused5_ssd_kernel(
     ########################################
     # Chunk State
     ########################################
-
-    if HAS_SEQ_IDX:
-        seq_idx_ptr += pid_b * stride_seq_idx_batch
 
     # wait for this (batch, chunk)
     first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
@@ -293,12 +290,12 @@ def _fused5_ssd_kernel(
         dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
         dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
         if HAS_SEQ_IDX:
-            seq_idx_ptrs_cs = seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
+            seq_idx_ptrs_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
 
         # chunk state other setup
         chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
         if HAS_SEQ_IDX:
-            seq_idx_last = tl.load(seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
+            seq_idx_last = tl.load(seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
         # chunk state chunk_size loop
         acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
@@ -341,8 +338,8 @@ def _fused5_ssd_kernel(
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             # TODO: need atomics here?
-            seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            seq_idx = tl.load(seq_idx_ptr + pid_b * stride_seq_idx_batch + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            seq_idx_new = tl.load(seq_idx_ptr + pid_b * stride_seq_idx_batch + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
         # sync
         # the atomic represents which pid_c is ready

@@ -64,7 +64,7 @@ def _fused5_ssd_kernel(
     # Tensor dimensions
     hdim: tl.constexpr, dstate: tl.constexpr, chunk_size: tl.constexpr, batch, seqlen, nheads_ngroups_ratio: tl.constexpr, nheads: tl.constexpr, nchunks, ngroups: tl.constexpr,
     # Tensor ptrs
-    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, cb_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
+    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, cb_ptr, cb_scale_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
     # Tensor strides
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
     stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
@@ -216,7 +216,7 @@ def _fused5_ssd_kernel(
             b_ptrs = b_ptr_bmm + (offs_k[:, None] * stride_b_dstate + offs_n[None, :] * stride_b_seqlen)
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
-            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=cb_ptr.dtype.element_ty)
+            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float16)#cb_ptr.dtype.element_ty)
             for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
                 a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0)
                 b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0)
@@ -233,8 +233,14 @@ def _fused5_ssd_kernel(
                 acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
 
             out_ptr_cb = cb_ptr + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + pid_h * stride_cb_head
+            out_ptr_cb_scale = cb_scale_ptr + (pid_b * stride_cb_batch + pid_c * stride_cb_chunk + pid_h * stride_cb_head) // chunk_size
             out_ptrs_cb = out_ptr_cb + (stride_cb_csize_m * offs_m[:, None] + offs_n[None, :] * stride_cb_csize_k)
-            tl.store(out_ptrs_cb, acc, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+            out_ptrs_cb_scale = out_ptr_cb_scale + offs_n[None, :]
+            # cb_scale = acc.max(1, keep_dims=True) / 127.0 # will divide by this to clamp to +-127
+            cb_scale = tl.max(acc, 0, keep_dims=True) / 127.0 # will divide by this to clamp to +-127
+            # tl.store(out_ptrs_cb, acc, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+            tl.store(out_ptrs_cb, acc / cb_scale, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+            tl.store(out_ptrs_cb_scale, cb_scale, mask=(offs_n[None, :] < chunk_size))
         # mark progress
         tl.atomic_add(first2_wait_ptr + pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk, BMM_BLOCK_SIZE_M * BMM_BLOCK_SIZE_N, sem='release')
 
@@ -260,6 +266,7 @@ def _fused5_ssd_kernel(
     dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
     cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
+    cb_scale_ptr += (pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head) // chunk_size # TODO: fix here and above to use actual strides
     C_ptr += pid_b * stride_C_batch + pid_c * chunk_size * stride_C_seqlen + (pid_h // nheads_ngroups_ratio) * stride_C_head
     out_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
     sync_atomic += pid_b * stride_sync_batch + pid_h * stride_sync_head + pid_hd * stride_sync_hdim# + pid_ds * stride_sync_dstate
@@ -434,6 +441,7 @@ def _fused5_ssd_kernel(
 
         offs_k = tl.arange(0, CS_BLOCK_SIZE_CS_inner)
         cb_ptrs = cb_ptr + (offs_cs[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
+        cb_scale_ptrs = cb_scale_ptr + offs_k[None, :]
         x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen + offs_hd[None, :] * stride_x_hdim)
         dt_ptrs = dt_ptr + offs_k * stride_dt_csize
         dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
@@ -442,16 +450,20 @@ def _fused5_ssd_kernel(
             # NOTE: CB, dA, and dt (dt_out) are always allocated in chunks, it's always fine to read beyond seqlen within a chunk
             if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):
                 cb = tl.load(cb_ptrs, eviction_policy='evict_last')
+                cb_scale = tl.load(cb_scale_ptrs, eviction_policy='evict_last')
                 dA_cs_k = tl.load(dA_cumsum_ptrs).to(tl.float32)
                 dt_k = tl.load(dt_ptrs).to(acc.dtype)
             else:
                 cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
+                cb_scale = tl.load(cb_scale_ptrs, mask=(offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
                 dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
                 dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
             # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
             # So we don't need masking wrt seq_idx here.
+            # cb = cb.to(tl.float16) * cb_scale
+            cb = cb.to(tl.float16) * (cb_scale * dt_k)
             cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
-            cb *= dt_k
+            # cb *= dt_k
             if not NEED_MASK_HD:
                 x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_last')
             else:
@@ -461,6 +473,7 @@ def _fused5_ssd_kernel(
                 cb = tl.where(mask, cb, 0.0)
             acc += tl.dot(cb, x, out_dtype=acc.dtype)
             cb_ptrs += CS_BLOCK_SIZE_CS_inner * stride_cb_csize_k
+            cb_scale_ptrs += CS_BLOCK_SIZE_CS_inner
             x_ptrs += CS_BLOCK_SIZE_CS_inner * stride_x_seqlen
             dt_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dt_csize
             dA_cumsum_ptrs += CS_BLOCK_SIZE_CS_inner * stride_dA_cs_csize
@@ -539,7 +552,9 @@ def _fused5_ssd(
         assert seq_idx.shape == (batch, seqlen)
     states_dtype = torch.float32 if states_in_fp32 else B.dtype
     # setup from bmm
-    CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float16)
+    # CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float16)
+    CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.int8)
+    CB_scale = torch.empty((batch, nchunks, ngroups, chunk_size), device=C.device, dtype=torch.float16)
     # setup from state passing
     dA_chunk_cumsum = dA_cumsum[:, :, :, -1]
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
@@ -606,7 +621,7 @@ def _fused5_ssd(
         # Matrix dimensions
         hdim, dstate, chunk_size, batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
         # Tensor ptrs
-        x, B, dt_out, dA_cumsum, seq_idx, states_G, CB, z, out, out_x, C, D, A, dt_bias, dt,
+        x, B, dt_out, dA_cumsum, seq_idx, states_G, CB, CB_scale, z, out, out_x, C, D, A, dt_bias, dt,
         # Tensor strides
         x.stride(0), x.stride(1), x.stride(2), x.stride(3), # stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
         B.stride(0), B.stride(1), B.stride(2), B.stride(-1), # stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,

@@ -492,7 +492,7 @@ def _fused5_ssd_kernel(
 
 def _fused5_ssd(
     x, dt, A, B, C, D,
-    chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False, out_dtype=torch.float16,
+    chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False,
     use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
 ):
     """
@@ -548,9 +548,8 @@ def _fused5_ssd(
     if seq_idx is not None:
         assert chunk_size is not None
         assert seq_idx.shape == (batch, seqlen)
-    states_G_dtype = states_dtype if out_dtype is None else out_dtype
     # +1 for the final states
-    states_G = torch.empty((batch, nchunks + 1, nheads, hdim, dstate), device=x.device, dtype=states_G_dtype)
+    states_G = torch.empty((batch, nchunks + 1, nheads, hdim, dstate), device=x.device, dtype=states_dtype)
     # setup from chunk scan
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert CB.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
@@ -638,5 +637,5 @@ def _fused5_ssd(
     )
 
     # states_G holds both states and final states
-    # TODO: decide if it's ok that keeping a ref to final states will cause all states to take up VRAM
-    return out, out_x, states_G[:, :nchunks], states_G[:, nchunks], dA_cumsum, dt_out
+    final_states = states_G[:, nchunks].to(states_G.dtype, copy=True) # copy and convert to expected dtype
+    return out, out_x, states_G[:, :nchunks], final_states, dA_cumsum, dt_out

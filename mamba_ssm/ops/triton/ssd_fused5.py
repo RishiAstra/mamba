@@ -7,7 +7,7 @@ import triton.language as tl
 
 from packaging import version
 
-from mamba_ssm.ops.triton.softplus import softplus
+from .mamba_ssm import softplus
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(

@@ -18,7 +18,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # dstate and chunk_size blocks for chunk state and state passing
             'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
             # chunk scan config
-            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 32, 'CS_BLOCK_SIZE_DS': 64,
             'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
             # BMM config
             'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
@@ -62,7 +62,7 @@ def _fused5_ssd_kernel(
     first2_wait_ptr, first2_wait_stride_batch, first2_wait_stride_chunk, grid_atomic, USE_ATOMIC_PID: tl.constexpr, sync_atomic,
     stride_sync_batch, stride_sync_head, stride_sync_hdim, stride_sync_dstate,
     # Tensor dimensions
-    hdim, dstate, chunk_size, batch, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
+    hdim: tl.constexpr, dstate: tl.constexpr, chunk_size: tl.constexpr, batch, seqlen, nheads_ngroups_ratio: tl.constexpr, nheads: tl.constexpr, nchunks, ngroups: tl.constexpr,
     # Tensor ptrs
     x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, cb_ptr, z_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
     # Tensor strides
@@ -248,9 +248,9 @@ def _fused5_ssd_kernel(
     num_pid_ds = tl.cdiv(dstate, BLOCK_SIZE_DS)
     num_pid_hd = tl.cdiv(hdim, BLOCK_SIZE_HD)
     pid_h = pid_fused3 % nheads
-    pid_c = (pid_fused3 // (nheads)) % nchunks
-    pid_b = (pid_fused3 // (nheads * nchunks)) % batch
-    pid_hd = (pid_fused3 // (nheads * nchunks * batch)) % num_pid_hd
+    pid_hd = (pid_fused3 // (nheads)) % num_pid_hd
+    pid_c = (pid_fused3 // (nheads * num_pid_hd)) % nchunks
+    pid_b = (pid_fused3 // (nheads * num_pid_hd * nchunks)) % batch
 
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
@@ -267,9 +267,6 @@ def _fused5_ssd_kernel(
     ########################################
     # Chunk State
     ########################################
-
-    if HAS_SEQ_IDX:
-        seq_idx_ptr += pid_b * stride_seq_idx_batch
 
     # wait for this (batch, chunk)
     first2_wait_ptr += pid_b * first2_wait_stride_batch + pid_c * first2_wait_stride_chunk
@@ -293,21 +290,21 @@ def _fused5_ssd_kernel(
         dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
         dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
         if HAS_SEQ_IDX:
-            seq_idx_ptrs_cs = seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
+            seq_idx_ptrs_cs = seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen + offs_cs * stride_seq_idx_seqlen
 
         # chunk state other setup
         chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
         if HAS_SEQ_IDX:
-            seq_idx_last = tl.load(seq_idx_ptr + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
+            seq_idx_last = tl.load(seq_idx_ptr + pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
         # chunk state chunk_size loop
         acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=states_G_ptr.dtype.element_ty)
         for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
             if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                x = tl.load(x_ptrs_cs, mask=(offs_cs[None, :] < chunk_size_limit - k), other=0.0, cache_modifier='.cg')
                 b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
             else:
-                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, eviction_policy='evict_first')
+                x = tl.load(x_ptrs_cs, mask=(offs_hd[:, None] < hdim) & (offs_cs[None, :] < chunk_size_limit - k), other=0.0, cache_modifier='.cg')
                 b = tl.load(b_ptrs_cs, mask=(offs_cs[:, None] < chunk_size_limit - k) & (offs_ds[None, :] < dstate), other=0.0, eviction_policy='evict_first')
             dA_cs_k = tl.load(dA_cumsum_ptrs_cs, mask=offs_cs < chunk_size_limit - k, other=0.0).to(tl.float32)
             if HAS_SEQ_IDX:
@@ -317,7 +314,7 @@ def _fused5_ssd_kernel(
                 scale = tl.exp((dA_cs_last - dA_cs_k)) * dt_k
             else:
                 scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
-            b *= (scale[:, None]).to(x_ptr.dtype.element_ty)
+            x *= (scale[None, :]).to(x_ptr.dtype.element_ty)
             acc += tl.dot(x, b, out_dtype=acc.dtype)
             x_ptrs_cs += BLOCK_SIZE_CS * stride_x_seqlen
             b_ptrs_cs += BLOCK_SIZE_CS * stride_b_seqlen
@@ -341,8 +338,8 @@ def _fused5_ssd_kernel(
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             # TODO: need atomics here?
-            seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            seq_idx = tl.load(seq_idx_ptr + pid_b * stride_seq_idx_batch + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+            seq_idx_new = tl.load(seq_idx_ptr + pid_b * stride_seq_idx_batch + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
         # sync
         # the atomic represents which pid_c is ready
@@ -492,7 +489,7 @@ def _fused5_ssd_kernel(
 
 def _fused5_ssd(
     x, dt, A, B, C, D,
-    chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False, out_dtype=torch.float16,
+    chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False,
     use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
 ):
     """
@@ -548,9 +545,8 @@ def _fused5_ssd(
     if seq_idx is not None:
         assert chunk_size is not None
         assert seq_idx.shape == (batch, seqlen)
-    states_G_dtype = states_dtype if out_dtype is None else out_dtype
     # +1 for the final states
-    states_G = torch.empty((batch, nchunks + 1, nheads, hdim, dstate), device=x.device, dtype=states_G_dtype)
+    states_G = torch.empty((batch, nchunks + 1, nheads, hdim, dstate), device=x.device, dtype=states_dtype)
     # setup from chunk scan
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert CB.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
@@ -638,5 +634,6 @@ def _fused5_ssd(
     )
 
     # states_G holds both states and final states
-    # TODO: decide if it's ok that keeping a ref to final states will cause all states to take up VRAM
-    return out, out_x, states_G[:, :nchunks], states_G[:, nchunks], dA_cumsum, dt_out
+    # TODO: can skip this copy if copied outside of function
+    final_states = states_G[:, nchunks].to(states_G.dtype, copy=True) # copy and convert to expected dtype
+    return out, out_x, states_G[:, :nchunks], final_states, dA_cumsum, dt_out

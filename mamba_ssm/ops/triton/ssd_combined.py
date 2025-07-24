@@ -323,7 +323,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if use_fused5_ssd: # all 5 kernels fused
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
             x, dt, A, B, C, D,
-            chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z, out_dtype=C.dtype,
+            chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z,
             states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
         )
     else: # original

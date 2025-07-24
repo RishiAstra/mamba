@@ -81,6 +81,7 @@ counter = 64 # skip warmup tensors, but warmup tensors should be the same anyway
 def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
     torch.manual_seed(0)
+    random.seed(0)
 
     dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.2 + 0.5
     dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE) * 0.5 - 5
@@ -114,14 +115,16 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
         no_seq_idx_b = -1
         if batch > 1:
             no_seq_idx_b = random.randint(0, batch)
+        max_part_seqlen = seqlen // 4
         for b in range(batch):
-            split = random.randint(0, seqlen)
+            split = random.randint(1, max_part_seqlen)
             while split < seqlen and b != no_seq_idx_b:
                 seq_idx[b, split] = 1
-                split += random.randint(0, seqlen)
+                split += random.randint(1, max_part_seqlen)
 
-        seq_idx = seq_idx.to(device=DEVICE)
-        seq_idx = torch.cumsum(seq_idx, dim=-1).to(torch.int32)
+        seq_idx = seq_idx.to(device=DEVICE, dtype=torch.int32)
+        seq_idx = torch.cumsum(seq_idx, dim=-1, dtype=torch.int32)
+        # print(seq_idx)
 
     else:
         seq_idx = None

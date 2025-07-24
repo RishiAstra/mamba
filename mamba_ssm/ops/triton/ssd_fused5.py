@@ -64,7 +64,7 @@ def _fused5_ssd_kernel(
     # Tensor dimensions
     hdim: tl.constexpr, dstate: tl.constexpr, chunk_size: tl.constexpr, seqlen, nheads_ngroups_ratio: tl.constexpr, nheads: tl.constexpr, nchunks, ngroups: tl.constexpr,
     # Tensor ptrs
-    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, initial_states_ptr, cb_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
+    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, initial_states_ptr, chunk_indices_ptr, chunk_offsets_ptr, cb_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
     # Tensor strides
     stride_x_seqlen, stride_x_head, stride_x_hdim,
     stride_b_seqlen, stride_b_head, stride_b_dstate,
@@ -84,7 +84,7 @@ def _fused5_ssd_kernel(
     dt_min, dt_max,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr, HAS_D: tl.constexpr, D_HAS_HDIM: tl.constexpr,
-    HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr,
+    HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr, HAS_INITSTATES: tl.constexpr,
     # Block sizes
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, 
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
@@ -325,11 +325,15 @@ def _fused5_ssd_kernel(
         # offset gets us to the end of each chunk
         dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
         scale = tl.exp(dA_cs)
-        if HAS_SEQ_IDX:
-            # TODO: need atomics here?
-            seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+
+
+
+        # if HAS_SEQ_IDX:
+        # TODO: HAS_SEQ_IDX should always be true
+        seq_idx = tl.load(seq_idx_ptr + (min(pid_c * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+        seq_idx_new = tl.load(seq_idx_ptr + (min((pid_c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+        scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+
         # sync
         # the atomic represents which pid_c is ready
         # therefore, wait for it to reach our pid_c
@@ -337,11 +341,35 @@ def _fused5_ssd_kernel(
         while sync_val < pid_c:
             sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
 
-        # need to load states from previous one (but already offset by 1 so no offset)
-        if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-            states_prev = tl.load(state_G_ptrs)
+
+        
+        if HAS_INITSTATES:
+            if seq_idx != seq_idx_new:
+                # this means in the current chunk the rightmost flushed seq
+                # has changed.
+                # - so we do not propagate the state from previous chunk
+                # - but rather we load that sequence's init state
+                initstates_ptrs = initial_states_ptr + pid_h * stride_initial_states_head + \
+                    seq_idx_new * stride_initial_states_batch + \
+                    offs_hd[:, None] * stride_initial_states_hdim + offs_ds[None, :] * stride_initial_states_dstate
+                # - update state with seq_idx_new's init state
+                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                    states_prev = tl.load(initstates_ptrs)
+                else:
+                    states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0)
+            else:
+                # need to load states from previous one (but already offset by 1 so no offset)
+                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                    states_prev = tl.load(state_G_ptrs)
+                else:
+                    states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
         else:
-            states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+            # need to load states from previous one (but already offset by 1 so no offset)
+            if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                states_prev = tl.load(state_G_ptrs)
+            else:
+                states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
 
         states_mod = scale * states_prev + states # NOTE: scale.to(tl.float16) seems to slow it down
         
@@ -550,6 +578,9 @@ def _fused5_ssd(
                 (
                     "chunk_indices and chunk_offsets should have been set"
                 )
+
+        # TODO: try copying all init states here if it's cheaper
+        states_G[0, :, :, :] = initial_states[0, :, :, :] # initialize to zero
     else:
         states_G[0, :, :, :] = 0 # initialize to zero
         chunk_indices, chunk_offsets = None, None
@@ -589,7 +620,7 @@ def _fused5_ssd(
         # Matrix dimensions
         hdim, dstate, chunk_size, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
         # Tensor ptrs
-        x, B, dt_out, dA_cumsum, seq_idx, states_G, initial_states, CB, out, out_x, C, D, A, dt_bias, dt,
+        x, B, dt_out, dA_cumsum, seq_idx, states_G, initial_states, chunk_indices, chunk_offsets, CB, out, out_x, C, D, A, dt_bias, dt,
         # Tensor strides
         x.stride(0), x.stride(1), x.stride(2), # stride_x_seqlen, stride_x_head, stride_x_hdim,
         B.stride(0), B.stride(1), B.stride(-1), # stride_b_seqlen, stride_b_head, stride_b_dstate,
@@ -617,6 +648,7 @@ def _fused5_ssd(
         BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,
+        HAS_INITSTATES = initial_states is not None,
     )
 
     # states_G holds both states and final states

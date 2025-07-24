@@ -314,7 +314,7 @@ def _fused5_ssd_kernel(
                 scale = tl.exp((dA_cs_last - dA_cs_k)) * dt_k
             else:
                 scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
-            b *= (scale[:, None]).to(x_ptr.dtype.element_ty)
+            x *= (scale[None, :]).to(x_ptr.dtype.element_ty)
             acc += tl.dot(x, b, out_dtype=acc.dtype)
             x_ptrs_cs += BLOCK_SIZE_CS * stride_x_seqlen
             b_ptrs_cs += BLOCK_SIZE_CS * stride_b_seqlen

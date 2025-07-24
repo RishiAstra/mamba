@@ -1,6 +1,6 @@
 # some code from https://triton-lang.org/main/getting-started/tutorials/...
 
-CHECK_CORRECTNESS = False
+CHECK_CORRECTNESS = True
 USE_GIVEN_TEST_TENSORS = False # real prompt data, loads from files
 if not CHECK_CORRECTNESS:
     USE_GIVEN_TEST_TENSORS = False
@@ -11,9 +11,9 @@ CHUNK_SIZE_ORIGINAL=128
 CHUNK_SIZE_FUSED=128
 
 
-have_init_states    = False
+have_init_states    = True
 have_seq_idx        = True
-have_cu_seqlens     = False # TODO: test
+have_cu_seqlens     = True
 have_dt_softplus    = True # TODO: test more
 
 
@@ -28,13 +28,13 @@ from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, chunk_indices, chunk_offsets):
     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=False, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets)
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
-        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+        outputs = outputs[0], outputs[1], None, None, None, *outputs[5:]
     return outputs
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, chunk_indices, chunk_offsets):
     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets)
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
-        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+        outputs = outputs[0], outputs[1], None, None, None, *outputs[5:]
     return outputs
 
 things_to_compare = [
@@ -140,42 +140,50 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
         dt =        torch.load(f"{dump_name}/dt_in{counter}")
         x =         torch.load(f"{dump_name}/x_in{counter}")
 
-    if have_init_states:
-        initial_states = torch.randn((batch, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
-    else:
-        initial_states = None
-
+    varlen_count = 0
     if have_seq_idx:
+        if not have_cu_seqlens:
+            cu_seqlens = torch.tensor((0, seqlen), dtype=torch.int32, device='cpu')
+        else:
+            cu_seqlens = [0]
         # example at https://github.com/state-spaces/mamba/issues/383
 
         seq_idx = torch.zeros((batch, seqlen), dtype=torch.int32, device='cpu')
-        # have at least 1 batch not have multiple sequences if b > 1
-        no_seq_idx_b = -1
-        if batch > 1:
-            no_seq_idx_b = random.randint(0, batch)
+        assert batch == 1
         max_part_seqlen = seqlen // 4
-        for b in range(batch):
-            split = random.randint(1, max_part_seqlen)
-            while split < seqlen and b != no_seq_idx_b:
-                seq_idx[b, split] = 1
-                split += random.randint(1, max_part_seqlen)
+        split = random.randint(1, max_part_seqlen)
+        while split < seqlen:
+            seq_idx[0, split] = 1
+            if have_cu_seqlens:
+                cu_seqlens.append(split)
+                varlen_count += 1
+            split += random.randint(1, max_part_seqlen)
+
+        if have_cu_seqlens:
+            cu_seqlens.append(seqlen)
+            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cpu')
 
         seq_idx = seq_idx.to(device=DEVICE, dtype=torch.int32)
         seq_idx = torch.cumsum(seq_idx, dim=-1, dtype=torch.int32)
         # print(seq_idx)
-
     else:
         seq_idx = torch.zeros((1, seqlen), dtype=torch.int32, device='cuda')
+        cu_seqlens = torch.tensor((0, seqlen), dtype=torch.int32, device='cpu')
+
+    if have_init_states:
+        assert have_cu_seqlens
+        initial_states = torch.randn((varlen_count, nheads, headdim, dstate), dtype=torch.float16, device=DEVICE) * 0.2
+    else:
+        initial_states = None
 
     chunk_indices, chunk_offsets = \
             _query_start_loc_to_chunk_indices_offsets(
-                torch.tensor((0, seqlen), dtype=torch.int32, device='cpu'), CHUNK_SIZE_ORIGINAL if is_original else CHUNK_SIZE_FUSED, seqlen)
-    
+                cu_seqlens, CHUNK_SIZE_ORIGINAL if is_original else CHUNK_SIZE_FUSED, seqlen)
+
     chunk_indices = chunk_indices.to('cuda')
     chunk_offsets = chunk_offsets.to('cuda')
-    # TODO: cu_seqlens
-    return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, None, chunk_indices, chunk_offsets #, cu_seqlens
-
+    cu_seqlens = cu_seqlens.to('cuda')
+    return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens if have_cu_seqlens else None, chunk_indices, chunk_offsets
 
 def run_unit_test(seqlen):
     # raise Exception("Not implemented")
@@ -194,7 +202,7 @@ def run_unit_test(seqlen):
     #         x, dt, A, B, C, CHUNK_SIZE, D=D, z=None, dt_bias=dt_bias,
     #         initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
     #         ) for thing in things_to_compare]
-    field_names = ["out", "out_x", "dt", "dA_cumsum", "states", "final_states"]
+    field_names = ["out", "out_x", "dt", "dA_cumsum", "states", "final_states", "varlen_states"]
     for field_idx in range(len(outputs_full[0])):
         outputs_0 = outputs_full[0][field_idx]
         if outputs_0 is None: # skip None
@@ -219,12 +227,12 @@ def run_unit_test(seqlen):
                 bad_i = i
             max_diff_idx = torch.argmax(torch.abs(outputs_i - outputs_0))
             max_diff = torch.abs(outputs_i.reshape(-1)[max_diff_idx] - outputs_0.reshape(-1)[max_diff_idx])
-            print(f"max diff: {max_diff} for {max_diff_idx} index, a: {outputs_i.reshape(-1)[max_diff_idx]}, b: {outputs_0.reshape(-1)[max_diff_idx]}")
+            print(f"max diff: {max_diff} for {max_diff_idx} index, test: {outputs_i.reshape(-1)[max_diff_idx]}, ref: {outputs_0.reshape(-1)[max_diff_idx]}")
             max_allowed_diff = atol + rtol * torch.abs(outputs_0)
             max_diff_frac = torch.abs(outputs_i - outputs_0) / max_allowed_diff
             max_rdiff_idx = torch.argmax(max_diff_frac)
             max_rdiff = max_diff_frac.reshape(-1)[max_rdiff_idx]
-            print(f"max diff score: {max_rdiff} for {max_rdiff_idx} index, a: {outputs_i.reshape(-1)[max_rdiff_idx]}, b: {outputs_0.reshape(-1)[max_rdiff_idx]}")
+            print(f"max diff score: {max_rdiff} for {max_rdiff_idx} index, test: {outputs_i.reshape(-1)[max_rdiff_idx]}, ref: {outputs_0.reshape(-1)[max_rdiff_idx]}")
             fail_bools = torch.abs(outputs_i - outputs_0) > atol + rtol * torch.abs(outputs_0)
             fail_bool_num = fail_bools.sum().cpu().item()
             total_elems = outputs_0.numel()

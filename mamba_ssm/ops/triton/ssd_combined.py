@@ -313,7 +313,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+        assert initial_states.shape[1:] == (nheads, headdim, dstate)
 
     assert batch == 1
     seq_idx = seq_idx.squeeze(0)

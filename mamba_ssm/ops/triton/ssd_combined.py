@@ -327,6 +327,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
             x, dt, A, B, C, D,
             chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z,
             states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
+            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
         )
     else: # original
         # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)

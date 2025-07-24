@@ -64,7 +64,7 @@ def _fused5_ssd_kernel(
     # Tensor dimensions
     hdim: tl.constexpr, dstate: tl.constexpr, chunk_size: tl.constexpr, seqlen, nheads_ngroups_ratio: tl.constexpr, nheads: tl.constexpr, nchunks, ngroups: tl.constexpr,
     # Tensor ptrs
-    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, cb_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
+    x_ptr, b_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, states_G_ptr, initial_states_ptr, cb_ptr, out_ptr, out_x_ptr, C_ptr, D_ptr, A_ptr, dt_bias_ptr, dt_orig_ptr,
     # Tensor strides
     stride_x_seqlen, stride_x_head, stride_x_hdim,
     stride_b_seqlen, stride_b_head, stride_b_dstate,
@@ -72,6 +72,7 @@ def _fused5_ssd_kernel(
     stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
     stride_seq_idx_seqlen,
     stride_states_G_chunk, stride_states_G_head, stride_states_G_hdim, stride_states_G_dstate,
+    stride_initial_states_batch, stride_initial_states_head, stride_initial_states_hdim, stride_initial_states_dstate,
     stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_k,
     stride_out_seqlen, stride_out_head, stride_out_hdim,
     stride_C_seqlen, stride_C_head, stride_C_dstate,
@@ -467,7 +468,8 @@ def _fused5_ssd_kernel(
 def _fused5_ssd(
     x, dt, A, B, C, D,
     chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False,
-    use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
+    use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
+    chunk_indices=None, chunk_offsets=None,
 ):
     """
     Runs the Mamba2 SSD with 1 large fused kernel instead of the 5 original kernels,
@@ -517,7 +519,10 @@ def _fused5_ssd(
     dA_chunk_cumsum = dA_cumsum[:, :, -1]
     assert dA_chunk_cumsum.shape == (nheads, nchunks)
     if initial_states is not None:
-        assert initial_states.shape == (nheads, hdim, dstate)
+        batch = initial_states.shape[0]
+        assert initial_states.shape == (batch, nheads, hdim, dstate)
+    else:
+        batch = None
     if seq_idx is not None:
         assert chunk_size is not None
         assert seq_idx.shape == (seqlen,)
@@ -532,6 +537,29 @@ def _fused5_ssd(
     out = torch.empty(seqlen, nheads, hdim, device=x.device, dtype=x.dtype)
     out_x = None
 
+    if initial_states is not None:
+        # with initial states, we need to take care of how
+        # seq_idx crosses the boundaries
+
+        if initial_states.shape[0] == 1:
+            # no in this case no point to use initial states
+            initial_states = None
+            batch = None
+        else:
+            assert chunk_indices is not None and chunk_offsets is not None, \
+                (
+                    "chunk_indices and chunk_offsets should have been set"
+                )
+    else:
+        states_G[0, :, :, :] = 0 # initialize to zero
+        chunk_indices, chunk_offsets = None, None
+
+    initial_states_strides = ((initial_states.stride(0),
+                            initial_states.stride(1),
+                            initial_states.stride(2),
+                            initial_states.stride(3))
+                            if initial_states is not None else (0, 0, 0, 0))
+
     grid = lambda META: (
         # Chunk Cumsum grid
         nchunks * triton.cdiv(nheads, META['CCS_BLOCK_SIZE_H']) +
@@ -540,15 +568,6 @@ def _fused5_ssd(
         # fused3 grid
         nchunks * nheads * triton.cdiv(hdim, META['BLOCK_SIZE_HD'])
     ,)
-
-    # for some reason, it's far faster to do this outside of the kernel
-    # this probably reduces register pressure and instructions a lot
-    if initial_states is not None:
-        # nchunks, nheads, hdim, dstate
-        # nheads, hdim, dstate
-        states_G[0, :, :, :] = initial_states[None, :, :, :]
-    else:
-        states_G[0, :, :, :] = 0
 
     # 32 is for cache lines, dstate is not used here
     states_ready_size = nheads * hdim * dstate
@@ -570,7 +589,7 @@ def _fused5_ssd(
         # Matrix dimensions
         hdim, dstate, chunk_size, seqlen, nheads_ngroups_ratio, nheads, nchunks, ngroups,
         # Tensor ptrs
-        x, B, dt_out, dA_cumsum, seq_idx, states_G, CB, out, out_x, C, D, A, dt_bias, dt,
+        x, B, dt_out, dA_cumsum, seq_idx, states_G, initial_states, CB, out, out_x, C, D, A, dt_bias, dt,
         # Tensor strides
         x.stride(0), x.stride(1), x.stride(2), # stride_x_seqlen, stride_x_head, stride_x_hdim,
         B.stride(0), B.stride(1), B.stride(-1), # stride_b_seqlen, stride_b_head, stride_b_dstate,
@@ -578,6 +597,7 @@ def _fused5_ssd(
         dA_cumsum.stride(1), dA_cumsum.stride(0), dA_cumsum.stride(2), # stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
         seq_idx.stride(0) if seq_idx is not None else 0, # stride_seq_idx_seqlen,
         states_G.stride(0), states_G.stride(1), states_G.stride(2), states_G.stride(3),
+        *initial_states_strides,
         CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(3),
         out.stride(0), out.stride(1), out.stride(2),
         C.stride(0), C.stride(1), C.stride(2),

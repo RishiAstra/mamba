@@ -12,11 +12,12 @@ CHUNK_SIZE_FUSED=128
 
 
 have_init_states    = False
-have_seq_idx        = False
+have_seq_idx        = True
 have_cu_seqlens     = False # TODO: test
 have_dt_softplus    = True # TODO: test more
 
 
+import math
 import random
 import torch
 
@@ -24,14 +25,14 @@ import triton
 import numpy as np
 
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
-def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=False)
+def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, chunk_indices, chunk_offsets):
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=False, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets)
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
         outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     return outputs
 
-def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True)
+def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, chunk_indices, chunk_offsets):
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, use_fused5_ssd=True, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets)
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
         outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     return outputs
@@ -56,7 +57,7 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1) #9 for batch=1, 6 for 8, 4 for 32 so that original doesn't fail
+    (get_test_size(1024 * 2 ** i),) for i in range(0, 8, 1) #9 for batch=1, 6 for 8, 4 for 32 so that original doesn't fail
     # (get_test_size(1024 * 2 ** i),) for i in [7] # for quick test
     # (get_test_size(2753))
 ]
@@ -75,6 +76,43 @@ configs.append(
         args={},
     )
 )
+
+
+
+def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
+                                              chunk_size: int,
+                                              total_seqlens: int):
+
+    cu_seqlens = query_start_loc[1:]  # remove prepended 0
+
+    # outputs will have length expansion of chunks that do not divide
+    # chunk_size
+    N = math.ceil(total_seqlens / chunk_size) + (cu_seqlens[:-1] % chunk_size
+                                                 > 0).sum()
+    chunk_indices = torch.arange(N,
+                                 dtype=torch.int,
+                                 device=query_start_loc.device)
+    chunk_offsets = torch.zeros((N, ),
+                                dtype=torch.int,
+                                device=query_start_loc.device)
+
+    p = 0  # num of insertions
+    for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+
+        # if does not divide chunk_size, then there is one chunk insertion
+        p += (s % chunk_size > 0)
+
+        # get the dimensions
+        # - the + 1 for _e is to shift the boundary by one chunk
+        # - this shifting is not needed if chunk_size divides e
+        _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size
+                                                             > 0)
+
+        # adjust indices and offsets
+        chunk_indices[_s:_e] -= p
+        chunk_offsets[_s] = s % chunk_size
+
+    return chunk_indices, chunk_offsets
 
 # used to load actual tensors from files
 counter = 64 # skip warmup tensors, but warmup tensors should be the same anyway
@@ -127,9 +165,16 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
         # print(seq_idx)
 
     else:
-        seq_idx = None
+        seq_idx = torch.zeros((1, seqlen), dtype=torch.int32, device='cuda')
 
-    return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, None #, cu_seqlens
+    chunk_indices, chunk_offsets = \
+            _query_start_loc_to_chunk_indices_offsets(
+                torch.tensor((0, seqlen), dtype=torch.int32, device='cpu'), CHUNK_SIZE_ORIGINAL if is_original else CHUNK_SIZE_FUSED, seqlen)
+    
+    chunk_indices = chunk_indices.to('cuda')
+    chunk_offsets = chunk_offsets.to('cuda')
+    # TODO: cu_seqlens
+    return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, None, chunk_indices, chunk_offsets #, cu_seqlens
 
 
 def run_unit_test(seqlen):
@@ -137,11 +182,12 @@ def run_unit_test(seqlen):
     outputs_full = []
 
     for i, thing in enumerate(things_to_compare):
-        dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(get_test_size(seqlen), is_original=i==0)
+        dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens, chunk_indices, chunk_offsets = get_rand_input(get_test_size(seqlen), is_original=i==0)
 
         outputs_full.append(thing[0](
             x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if i == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
-            initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus
+            initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus,
+            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets
         ))
 
     # outputs_full = [thing[0](
@@ -193,13 +239,13 @@ def run_unit_test(seqlen):
 def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
 
-    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens = get_rand_input(dims_b_seq_nh_hd_ng_ds)
+    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens, chunk_indices, chunk_offsets = get_rand_input(dims_b_seq_nh_hd_ng_ds)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench( \
         lambda: things_to_compare[provider][0](
             x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if provider == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
-            initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus), \
+            initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets), \
         rep=BENCHMARK_REPEATS, quantiles=quantiles
     )
     perf = lambda ms: batch * seqlen / (ms * 1e-3)

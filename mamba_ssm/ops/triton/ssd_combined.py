@@ -284,43 +284,10 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt.to(dtype=dt.dtype), dD
 
 
-def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
-                                              chunk_size: int,
-                                              total_seqlens: int):
-
-    cu_seqlens = query_start_loc[1:]  # remove prepended 0
-
-    # outputs will have length expansion of chunks that do not divide
-    # chunk_size
-    N = math.ceil(total_seqlens / chunk_size) + (cu_seqlens[:-1] % chunk_size
-                                                 > 0).sum()
-    chunk_indices = torch.arange(N,
-                                 dtype=torch.int,
-                                 device=query_start_loc.device)
-    chunk_offsets = torch.zeros((N, ),
-                                dtype=torch.int,
-                                device=query_start_loc.device)
-
-    p = 0  # num of insertions
-    for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
-        # if does not divide chunk_size, then there is one chunk insertion
-        p += (s % chunk_size > 0)
-
-        # get the dimensions
-        # - the + 1 for _e is to shift the boundary by one chunk
-        # - this shifting is not needed if chunk_size divides e
-        _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size
-                                                             > 0)
-
-        # adjust indices and offsets
-        chunk_indices[_s:_e] -= p
-        chunk_offsets[_s] = s % chunk_size
-
-    return chunk_indices, chunk_offsets
-
-
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused5_ssd=False):
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused5_ssd=False, chunk_indices=None, chunk_offsets=None):
+    assert chunk_indices is not None
+    assert chunk_offsets is not None
+    
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -348,14 +315,13 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
-    seq_idx = torch.zeros((1, seqlen), dtype=torch.int32, device='cuda')
-    chunk_indices, chunk_offsets = \
-            _query_start_loc_to_chunk_indices_offsets(
-                torch.tensor((0, seqlen), dtype=torch.int32, device='cpu'), chunk_size, seqlen)
-    
-    chunk_indices = chunk_indices.to('cuda')
-    chunk_offsets = chunk_offsets.to('cuda')
-
+    assert batch == 1
+    seq_idx = seq_idx.squeeze(0)
+    x = x.squeeze(0)
+    dt = dt.squeeze(0)
+    A = A.squeeze(0)
+    B = B.squeeze(0)
+    C = C.squeeze(0)
     if use_fused5_ssd: # all 5 kernels fused
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
             x, dt, A, B, C, D,
@@ -363,13 +329,6 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
             states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
         )
     else: # original
-        assert batch == 1
-        seq_idx = seq_idx.squeeze(0)
-        x = x.squeeze(0)
-        dt = dt.squeeze(0)
-        A = A.squeeze(0)
-        B = B.squeeze(0)
-        C = C.squeeze(0)
         # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
         # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
         # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)

@@ -284,7 +284,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt.to(dtype=dt.dtype), dD
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused5_ssd=False, chunk_indices=None, chunk_offsets=None):
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), use_fused5_ssd=False, chunk_indices=None, chunk_offsets=None, chunk_inv_start=None):
     assert chunk_indices is not None
     assert chunk_offsets is not None
     
@@ -301,7 +301,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if D is not None:
         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
     if seq_idx is not None:
-        assert seq_idx.shape == (batch, seqlen)
+        assert seq_idx.shape == (batch, seqlen), f"bad: batch: {batch} seqlen: {seqlen}, shape: {seq_idx.shape}"
     if B.stride(-1) != 1:
         B = B.contiguous()
     if C.stride(-1) != 1:
@@ -323,11 +323,13 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     B = B.squeeze(0)
     C = C.squeeze(0)
     if use_fused5_ssd: # all 5 kernels fused
+        if initial_states is None:
+            initial_states = torch.randn((1, nheads, headdim, dstate), dtype=torch.float16, device='cuda')
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
             x, dt, A, B, C, D,
             chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z,
             states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
-            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
+            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets, chunk_inv_start=chunk_inv_start,
         )
     else: # original
         # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
@@ -351,14 +353,22 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
         CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
         out, _ = _chunk_scan_fwd( CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets, initial_states=initial_states,)
+        final_states = None
+
+    out = out.unsqueeze(0)
+    dt = dt.unsqueeze(0)
+    dA_cumsum = dA_cumsum.unsqueeze(0)
+    states = states.unsqueeze(0)
+    if final_states is not None:
+        final_states = final_states.unsqueeze(0)
 
     if cu_seqlens is None:
-        return out, None, dt, dA_cumsum, states, None # TODO: final_states returned?
+        return out, None, dt, dA_cumsum, states, final_states # TODO: final_states returned?
     else:
         assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
         varlen_states = chunk_state_varlen(B.squeeze(0), x.squeeze(0), dt.squeeze(0), dA_cumsum.squeeze(0),
                                            cu_seqlens, states.squeeze(0))
-        return out, None, dt, dA_cumsum, states, None, varlen_states
+        return out, None, dt, dA_cumsum, states, final_states, varlen_states
 
 
 
@@ -439,6 +449,42 @@ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
     return ddt, dA
 
 
+def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
+                                              chunk_size: int,
+                                              total_seqlens: int):
+
+    cu_seqlens = query_start_loc[1:]  # remove prepended 0
+
+    # outputs will have length expansion of chunks that do not divide
+    # chunk_size
+    N = math.ceil(total_seqlens / chunk_size) + (cu_seqlens[:-1] % chunk_size
+                                                 > 0).sum()
+    chunk_indices = torch.arange(N,
+                                 dtype=torch.int,
+                                 device=query_start_loc.device)
+    chunk_offsets = torch.zeros((N, ),
+                                dtype=torch.int,
+                                device=query_start_loc.device)
+
+    p = 0  # num of insertions
+    for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+
+        # if does not divide chunk_size, then there is one chunk insertion
+        p += (s % chunk_size > 0)
+
+        # get the dimensions
+        # - the + 1 for _e is to shift the boundary by one chunk
+        # - this shifting is not needed if chunk_size divides e
+        _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size
+                                                             > 0)
+
+        # adjust indices and offsets
+        chunk_indices[_s:_e] -= p
+        chunk_offsets[_s] = s % chunk_size
+
+    return chunk_indices, chunk_offsets
+
+
 class MambaChunkScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
@@ -448,7 +494,16 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
             cu_seqlens = None
         else:
             assert cu_seqlens is not None, "cu_seqlens must be provided if return_varlen_states is True"
-        out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit, use_fused5_ssd=use_fused5_ssd)
+
+        assert x.shape[0] == 1
+        chunk_indices, chunk_offsets = \
+            _query_start_loc_to_chunk_indices_offsets(
+                torch.tensor([0, x.shape[1]], dtype=torch.int32, device='cpu'), chunk_size, x.shape[1])
+        chunk_indices = chunk_indices.to('cuda')
+        chunk_offsets = chunk_offsets.to('cuda')
+        assert seq_idx is None
+        seq_idx = torch.zeros((1, x.shape[1]), dtype=torch.int32, device='cuda')
+        out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit, use_fused5_ssd=use_fused5_ssd, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets)
         ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
         ctx.dt_softplus = dt_softplus
         ctx.chunk_size = chunk_size

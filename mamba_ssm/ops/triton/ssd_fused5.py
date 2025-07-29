@@ -337,35 +337,48 @@ def _fused5_ssd_kernel(
         while sync_val < pid_c:
             sync_val = tl.atomic_add(sync_atomic, 0, sem='acquire')
 
-
-        
+        states_prev_ptrs = state_G_ptrs
         if HAS_INITSTATES:
             if seq_idx != seq_idx_new:
-                # this means in the current chunk the rightmost flushed seq
-                # has changed.
-                # - so we do not propagate the state from previous chunk
-                # - but rather we load that sequence's init state
-                initstates_ptrs = initial_states_ptr + pid_h * stride_initial_states_head + \
-                    seq_idx_new * stride_initial_states_batch + \
-                    offs_hd[:, None] * stride_initial_states_hdim + offs_ds[None, :] * stride_initial_states_dstate
-                # - update state with seq_idx_new's init state
-                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                    states_prev = tl.load(initstates_ptrs)
-                else:
-                    states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0)
-            else:
-                # need to load states from previous one (but already offset by 1 so no offset)
-                if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                    states_prev = tl.load(state_G_ptrs)
-                else:
-                    states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+                states_prev_ptrs = initial_states_ptr + pid_h * stride_initial_states_head + \
+                seq_idx_new * stride_initial_states_batch + \
+                offs_hd[:, None] * stride_initial_states_hdim + offs_ds[None, :] * stride_initial_states_dstate
+        # if HAS_INITSTATES:
+        #     # states_prev_ptrs = state_G_ptrs
+        #     if seq_idx != seq_idx_new:
+        #         # states_prev_ptrs = initial_states_ptr + pid_h * stride_initial_states_head + \
+        #         #     seq_idx_new * stride_initial_states_batch + \
+        #         #     offs_hd[:, None] * stride_initial_states_hdim + offs_ds[None, :] * stride_initial_states_dstate
+        #         # this means in the current chunk the rightmost flushed seq
+        #         # has changed.
+        #         # - so we do not propagate the state from previous chunk
+        #         # - but rather we load that sequence's init state
+        #         initstates_ptrs = initial_states_ptr + pid_h * stride_initial_states_head + \
+        #             seq_idx_new * stride_initial_states_batch + \
+        #             offs_hd[:, None] * stride_initial_states_hdim + offs_ds[None, :] * stride_initial_states_dstate
+        #         # - update state with seq_idx_new's init state
+        #         if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+        #             states_prev = tl.load(initstates_ptrs)
+        #         else:
+        #             states_prev = tl.load(initstates_ptrs, mask=main_mask, other=0.0)
+        #     else:
+        #         # need to load states from previous one (but already offset by 1 so no offset)
+        #         if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+        #             states_prev = tl.load(state_G_ptrs)
+        #         else:
+        #             states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+        # else:
+        #     # scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        #     # need to load states from previous one (but already offset by 1 so no offset)
+        #     if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+        #         states_prev = tl.load(state_G_ptrs)
+        #     else:
+        #         states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+
+        if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+            states_prev = tl.load(states_prev_ptrs)
         else:
-            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
-            # need to load states from previous one (but already offset by 1 so no offset)
-            if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-                states_prev = tl.load(state_G_ptrs)
-            else:
-                states_prev = tl.load(state_G_ptrs, mask=main_mask, other=0.0)
+            states_prev = tl.load(states_prev_ptrs, mask=main_mask, other=0.0)
 
         states_mod = scale * states_prev + states # NOTE: scale.to(tl.float16) seems to slow it down
         
@@ -580,7 +593,7 @@ def _fused5_ssd(
     x, dt, A, B, C, D,
     chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False,
     use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
-    chunk_indices=None, chunk_offsets=None,
+    chunk_indices=None, chunk_offsets=None, chunk_inv_start=None,
 ):
     """
     Runs the Mamba2 SSD with 1 large fused kernel instead of the 5 original kernels,
@@ -662,16 +675,6 @@ def _fused5_ssd(
         # TODO: try copying all init states here if it's cheaper
         states_G[0, :, :, :] = initial_states[0, :, :, :] # initialize to zero
 
-        chunk_indices_cpu = chunk_indices.to('cpu').numpy()
-        # need offset by 1 because a logical chunk corresponding to a 
-        # physical chunk should push the next physical chunk boundry, not the current
-        chunk_inv_start = torch.zeros((nchunks + 1,), dtype=torch.int32, device='cpu')
-        for chunk_idx in chunk_indices_cpu:
-            chunk_inv_start[chunk_idx + 1] += 1
-        # now we have a map from physical chunk index to how many logical chunk indices
-        # cumsum gives us the start logical chunk for each physical chunk
-        chunk_inv_start = chunk_inv_start.to('cuda')
-        chunk_inv_start = chunk_inv_start.cumsum(dim=0)
     else:
         states_G[0, :, :, :] = 0 # initialize to zero
         chunk_indices, chunk_offsets = None, None

@@ -163,7 +163,7 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
 
         seq_idx = torch.zeros((batch, seqlen), dtype=torch.int32, device='cpu')
         assert batch == 1
-        max_part_seqlen = seqlen // 2#4#25
+        max_part_seqlen = seqlen // 2#100#25#2#4#25
         split = random.randint(1, max_part_seqlen)
         while split < seqlen:
             seq_idx[0, split] = 1
@@ -180,6 +180,7 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
         seq_idx = torch.cumsum(seq_idx, dim=-1, dtype=torch.int32)
         # print("seq_idx:", seq_idx)
         # print("cu_seqlens:", cu_seqlens)
+        # print("len cu_seqlens:", len(cu_seqlens))
     else:
         seq_idx = torch.zeros((1, seqlen), dtype=torch.int32, device='cuda')
         cu_seqlens = torch.tensor((0, seqlen), dtype=torch.int32, device='cpu')

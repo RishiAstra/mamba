@@ -163,7 +163,7 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
 
         seq_idx = torch.zeros((batch, seqlen), dtype=torch.int32, device='cpu')
         assert batch == 1
-        max_part_seqlen = seqlen // 2#100#25#2#4#25
+        max_part_seqlen = 1000 #seqlen // 2#100#25#2#4#25
         split = random.randint(1, max_part_seqlen)
         while split < seqlen:
             seq_idx[0, split] = 1
@@ -280,7 +280,7 @@ def run_unit_test(seqlen):
 def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
     batch, seqlen, nheads, headdim, ngroups, dstate = dims_b_seq_nh_hd_ng_ds
 
-    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens, chunk_indices, chunk_offsets, chunk_inv_start = get_rand_input(dims_b_seq_nh_hd_ng_ds)
+    dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens, chunk_indices, chunk_offsets, chunk_inv_start = get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=provider==0)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench( \

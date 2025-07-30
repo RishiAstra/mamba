@@ -323,8 +323,9 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     B = B.squeeze(0)
     C = C.squeeze(0)
     if use_fused5_ssd: # all 5 kernels fused
-        if initial_states is None:
-            initial_states = torch.randn((1, nheads, headdim, dstate), dtype=torch.float16, device='cuda')
+        # TODO: remove, was for ncu only
+        # if initial_states is None:
+        #     initial_states = torch.randn((1, nheads, headdim, dstate), dtype=torch.float16, device='cuda')
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
             x, dt, A, B, C, D,
             chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z,

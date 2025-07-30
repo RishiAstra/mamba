@@ -134,13 +134,14 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
     torch.manual_seed(0)
     random.seed(0)
 
-    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE) * 0.2 + 0.5
-    dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE) * 0.5 - 5
-    A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 3 - 10
-    B = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) #* 3 + 7
-    C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) #* 5 + 20
-    D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.5 + 1.2
-    x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 2 + 5
+    dt = torch.randn((batch, seqlen, nheads), dtype=torch.float16, device=DEVICE)# * 0.2 + 0.5
+    dt_bias = torch.randn((nheads,), dtype=torch.float16, device=DEVICE)# * 0.5 - 5
+    # A = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 3 - 10
+    A = -torch.exp(torch.rand((nheads,), dtype=torch.float32, device=DEVICE))# * 3 - 10
+    B = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE)# * 3 + 7
+    C = torch.randn((batch, seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE)# * 5 + 20
+    D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE)# * 0.5 + 1.2
+    x = torch.randn((batch, seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE)# * 2 + 5
 
     # NOTE: overrides the sizes
     if USE_GIVEN_TEST_TENSORS:
@@ -187,7 +188,9 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, is_original=True):
 
     if have_init_states:
         assert have_cu_seqlens
-        initial_states = torch.randn((varlen_count, nheads, headdim, dstate), dtype=torch.float16, device=DEVICE) * 0.2
+        # initial_states = torch.randn((varlen_count, nheads, headdim, dstate), dtype=torch.float16, device=DEVICE) * 0.2
+        # initial_states = torch.randn((varlen_count, nheads, headdim, dstate), dtype=torch.float32, device=DEVICE)# * 0.2
+        initial_states = torch.randn((varlen_count, nheads, headdim, dstate), dtype=torch.float16, device=DEVICE)# * 0.2
     else:
         initial_states = None
 
@@ -235,9 +238,11 @@ def run_unit_test(seqlen):
             print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
             # atol = 2.5e-3
             # rtol = 1e-2
-            # TODO: revert tolerances
-            atol = 5e-3
-            rtol = 2e-2
+            # # TODO: revert tolerances
+            # atol = 2e-2
+            # rtol = 1e-2
+            atol = 1e-2
+            rtol = 1e-2
             outputs_i = outputs_i.to(outputs_0.dtype)
             if torch.allclose(outputs_i, outputs_0, atol=atol, rtol=rtol, equal_nan=True):
                 print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")

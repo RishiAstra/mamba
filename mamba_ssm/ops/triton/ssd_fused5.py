@@ -205,10 +205,12 @@ def _fused5_ssd_kernel(
             b_ptrs = b_ptr_bmm + (offs_k[:, None] * stride_b_dstate + offs_n[None, :] * stride_b_seqlen)
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
-            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=cb_ptr.dtype.element_ty)
+            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float32)#cb_ptr.dtype.element_ty)
             for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
                 a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0)
                 b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0)
+                a = a.to(acc.dtype)
+                b = b.to(acc.dtype)
                 acc += tl.dot(a, b, out_dtype=acc.dtype)
                 a_ptrs += BMM_BLOCK_SIZE_K * stride_C_dstate
                 b_ptrs += BMM_BLOCK_SIZE_K * stride_b_dstate
@@ -533,6 +535,7 @@ def _fused5_ssd_kernel(
                     if IS_CAUSAL:
                         mask = offs_cs[:, None] >= k + offs_k[None, :]
                         cb = tl.where(mask, cb, 0.0)
+                    cb = cb.to(x.dtype)
                     acc += tl.dot(cb, x, out_dtype=acc.dtype)
                     cb_ptrs += CS_BLOCK_SIZE_CS_inner * stride_cb_csize_k
                     x_ptrs += CS_BLOCK_SIZE_CS_inner * stride_x_seqlen

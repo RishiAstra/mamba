@@ -329,10 +329,13 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
             x, dt, A, B, C, D,
             chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z,
-            states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
+            states_in_fp32=False, cb_store_fp32=False, cb_scale_fp32=False, cs_acc_fp32=False, cb_comp_fp32=False,
+            dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
             chunk_indices=chunk_indices, chunk_offsets=chunk_offsets, chunk_inv_start=chunk_inv_start,
         )
     else: # original
+        # TODO: remove
+        # initial_states = initial_states.to(torch.float32)
         # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
         # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
         # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)

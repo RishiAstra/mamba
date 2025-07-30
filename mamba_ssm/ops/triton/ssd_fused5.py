@@ -85,6 +85,9 @@ def _fused5_ssd_kernel(
     # Meta-parameters
     IS_CAUSAL: tl.constexpr, HAS_D: tl.constexpr, D_HAS_HDIM: tl.constexpr,
     IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr, HAS_INITSTATES: tl.constexpr,
+    CB_SCALE_FP32: tl.constexpr,
+    CS_ACC_FP32: tl.constexpr,
+    CB_COMP_FP32: tl.constexpr,
     # Block sizes
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, 
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
@@ -205,12 +208,13 @@ def _fused5_ssd_kernel(
             b_ptrs = b_ptr_bmm + (offs_k[:, None] * stride_b_dstate + offs_n[None, :] * stride_b_seqlen)
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
-            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float32)#cb_ptr.dtype.element_ty)
+            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float32 if CB_COMP_FP32 else cb_ptr.dtype.element_ty)
             for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
                 a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0)
                 b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0)
-                a = a.to(acc.dtype)
-                b = b.to(acc.dtype)
+                if CB_COMP_FP32:
+                    a = a.to(acc.dtype)
+                    b = b.to(acc.dtype)
                 acc += tl.dot(a, b, out_dtype=acc.dtype)
                 a_ptrs += BMM_BLOCK_SIZE_K * stride_C_dstate
                 b_ptrs += BMM_BLOCK_SIZE_K * stride_b_dstate
@@ -467,7 +471,7 @@ def _fused5_ssd_kernel(
                     # - handle seq idx when HAS_INITSTATES==False
                     seq_idx_m = tl.load(seq_idx_ptr + offs_cs * stride_seq_idx_seqlen, mask=offs_cs < chunk_size_limit, other=-1)
 
-                acc = tl.zeros((CS_BLOCK_SIZE_CS_outer, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty)
+                acc = tl.zeros((CS_BLOCK_SIZE_CS_outer, BLOCK_SIZE_HD), dtype=out_ptr.dtype.element_ty if not CS_ACC_FP32 else tl.float32)
 
                 # Without the if (pid_c > -1), with Triton 2.1.0, I get
                 # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
@@ -519,15 +523,19 @@ def _fused5_ssd_kernel(
                     if (not NEED_MASK_CS_CS_outer) and (not NEED_MASK_CS_CS_inner):
                         cb = tl.load(cb_ptrs, eviction_policy='evict_last')
                         dA_cs_k = tl.load(dA_cumsum_ptrs).to(tl.float32)
-                        dt_k = tl.load(dt_ptrs).to(acc.dtype)
+                        dt_k = tl.load(dt_ptrs).to(tl.float32 if CB_SCALE_FP32 else acc.dtype)
                     else:
                         cb = tl.load(cb_ptrs, mask=(offs_cs[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k), other=0.0, eviction_policy='evict_last')
                         dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
-                        dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(acc.dtype)
+                        dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32 if CB_SCALE_FP32 else acc.dtype)
                     # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
                     # So we don't need masking wrt seq_idx here.
-                    cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
-                    cb *= dt_k
+                    if CB_SCALE_FP32:
+                        cb = (cb.to(tl.float32) * tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])) * dt_k).to(acc.dtype)
+                    else:
+                        cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :])).to(acc.dtype)
+                        cb *= dt_k
+
                     if not NEED_MASK_HD:
                         x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k), other=0.0, eviction_policy='evict_last')
                     else:
@@ -561,7 +569,8 @@ def _fused5_ssd_kernel(
 
 def _fused5_ssd(
     x, dt, A, B, C, D,
-    chunk_size=256, initial_states=None, seq_idx=None, z=None, states_in_fp32=False,
+    chunk_size=256, initial_states=None, seq_idx=None, z=None,
+    states_in_fp32=False, cb_store_fp32=True, cb_scale_fp32=True, cs_acc_fp32=True, cb_comp_fp32=True,
     use_atomic_pid=True, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
     chunk_indices=None, chunk_offsets=None, chunk_inv_start=None,
 ):
@@ -608,7 +617,7 @@ def _fused5_ssd(
     assert B.shape == (seqlen, ngroups, dstate)
     states_dtype = torch.float32 if states_in_fp32 else B.dtype
     # setup from bmm
-    CB = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float16)
+    CB = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32 if cb_store_fp32 else torch.float16)
     # setup from state passing
     dA_chunk_cumsum = dA_cumsum[:, :, -1]
     assert dA_chunk_cumsum.shape == (nheads, nchunks)
@@ -713,6 +722,9 @@ def _fused5_ssd(
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,
         HAS_INITSTATES = initial_states is not None,
+        CB_SCALE_FP32=cb_scale_fp32,
+        CS_ACC_FP32=cs_acc_fp32,
+        CB_COMP_FP32=cb_comp_fp32,
     )
 
     # states_G holds both states and final states

@@ -321,10 +321,13 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
     if use_fused5_ssd: # all 5 kernels fused
+        # TODO: have options for precision, it seems like only cb_comp_fp32 is needed for pretty good
+        # TODO: also have chunk state computation accuracy option
         out, out_x, states, final_states, dA_cumsum, dt = _fused5_ssd(
             x, dt, A, B, C, D,
             chunk_size=chunk_size, initial_states=initial_states, seq_idx=seq_idx, z=z,
-            states_in_fp32=False, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
+            states_in_fp32=True, cb_store_fp32=True, cb_scale_fp32=True, cs_acc_fp32=True, cb_comp_fp32=True,
+            dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
         )
     else: # original
         # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)

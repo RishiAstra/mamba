@@ -3,6 +3,7 @@
 """We want triton==2.1.0 or 2.2.0 for this
 """
 
+import os
 from typing import Optional
 
 import math
@@ -319,6 +320,13 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         D = D.contiguous()
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
+
+    # allow environment variable to override
+    env_mamba2_fusion_type = os.environ.get('MAMBA2_FUSION_TYPE', "none")
+    if env_mamba2_fusion_type in ["unfused", "medium", "high"]:
+        mamba2_fusion_type = env_mamba2_fusion_type
+    elif env_mamba2_fusion_type != "none":
+        raise Exception(f"Bad environment MAMBA2_FUSION_TYPE variable: {env_mamba2_fusion_type}")
 
     if mamba2_fusion_type != "unfused": # all 5 kernels fused
         if mamba2_fusion_type == "medium":

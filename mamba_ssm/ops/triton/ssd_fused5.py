@@ -12,11 +12,13 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 @triton.autotune(
     configs=[
-        triton.Config({ # A100 SXM4 80GB and H100 80GB HBM3 same config
+        # good for medium precision
+        # A100 SXM4 80GB and H100 80GB HBM3 same config
+        triton.Config({ 
             # head dim block for chunk state, state passing, and chunk scan
             'BLOCK_SIZE_HD': 64,
             # dstate and chunk_size blocks for chunk state and state passing
-            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 32,
+            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 64,
             # chunk scan config
             'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 32, 'CS_BLOCK_SIZE_DS': 64,
             'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
@@ -25,6 +27,21 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             # cumsum config
             'CCS_BLOCK_SIZE_H': 16,
             }, num_stages=1, num_warps=4, maxnreg=128),
+        # good for high precision, but still far slower than medium precision
+        # A100 SXM4 80GB and H100 80GB HBM3 same config
+        triton.Config({
+            # head dim block for chunk state, state passing, and chunk scan
+            'BLOCK_SIZE_HD': 64,
+            # dstate and chunk_size blocks for chunk state and state passing
+            'BLOCK_SIZE_DS': 128, 'BLOCK_SIZE_CS': 64,
+            # chunk scan config
+            'CS_BLOCK_SIZE_CS_outer': 64, 'CS_BLOCK_SIZE_CS_inner': 64, 'CS_BLOCK_SIZE_DS': 64,
+            'CS_WHOLEBLOCK_DS': 128, # if dstate <= CS_WHOLEBLOCK_DS, we don't block along dstate
+            # BMM config
+            'BMM_BLOCK_SIZE_M': 64, 'BMM_BLOCK_SIZE_N': 64, 'BMM_BLOCK_SIZE_K': 64,
+            # cumsum config
+            'CCS_BLOCK_SIZE_H': 16,
+            }, num_stages=1, num_warps=8, maxnreg=128),
         # Use this for autotuning, it makes hundreds of configs though
         # You can also try other block size values not in the lists below
         # It's probably best to autotune the BMM and CCS block sizes separate from the other block sizes,

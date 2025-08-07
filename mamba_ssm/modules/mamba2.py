@@ -56,7 +56,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         bias=False,
         conv_bias=True,
         # Fused kernel and sharding options
-        chunk_size=256, # TODO: for unfused fp16 states, use 128 for ~10-15% speedup
+        # TODO: confirm that new default 128 (vs 256) is ok
+        # seems about as fast for original kernels
+        # but much better for fused kernel
+        chunk_size=128,
         use_mem_eff_path=True,
         layer_idx=None,  # Absorb kwarg for general module
         process_group=None,

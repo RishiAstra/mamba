@@ -25,7 +25,13 @@ parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--minp", type=float, default=0.0)
 parser.add_argument("--repetition-penalty", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
-parser.add_argument("--fused-mamba2", action='store_true', help="Enable faster fused Mamba2 prefill")
+parser.add_argument("--fused-mamba2-precision", type=str, default="unfused",
+                    choices=["unfused", "high", "medium"],
+                    help="Enable faster fused Mamba2 prefill."
+                    " \"high\": states and some intermediate values are fp32."
+                    " \"medium\": fp16.  with some fp32 values."
+                    " \"unfused\": uses the original unfused kernels."
+                    " For performance, \"medium\" is recommended in most cases.")
 args = parser.parse_args()
 
 repeats = 3
@@ -53,7 +59,7 @@ else:
     attn_mask = tokens.attention_mask.to(device=device)
 max_length = input_ids.shape[1] + args.genlen
 
-model_kwargs = {"use_mamba2_fused5_ssd": True} if args.fused_mamba2 else {}
+model_kwargs = {"mamba2_fusion_type": args.fused_mamba2_precision}
 
 if is_mamba:
     fn = lambda: model.generate(

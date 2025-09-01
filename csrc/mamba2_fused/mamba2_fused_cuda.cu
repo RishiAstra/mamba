@@ -29,16 +29,14 @@ __device__ __forceinline__ float softplusf(float x) {
 template <typename Params>
 __global__ __launch_bounds__(Params::THREADS, Params::TARGET_BLOCKS)
 void mamba2_ssd_step1_dt_transform_cumsum_kernel(
-    // inputs
-    const __half* __restrict__ dt,         // [B, S, H] (contiguous assumed for now)
-    const float*  __restrict__ A,          // [H]
-    const __half* __restrict__ dt_bias,    // [H]
+    const __half* __restrict__ dt,     // [B, S, H] contiguous
+    const float*  __restrict__ A,      // [H]
+    const __half* __restrict__ dt_bias,// [H]
     int B, int S, int H,
     int chunk_size,
     bool dt_softplus,
-    // outputs
-    float* __restrict__ dt_out,            // [B, n_chunks, H, chunk_size] fp32, zero-padded
-    float* __restrict__ dA_cumsum          // same shape as dt_out
+    float* __restrict__ dt_out,        // [B, H, n_chunks, chunk_size] fp32
+    float* __restrict__ dA_cumsum      // same shape
 ) {
     const int b = blockIdx.y;
     const int chunk_id = blockIdx.x;
@@ -48,50 +46,85 @@ void mamba2_ssd_step1_dt_transform_cumsum_kernel(
 
     const int s_start = chunk_id * chunk_size;
     if (s_start >= S) return;
-    const int s_end = min(s_start + chunk_size, S);
-    const int this_chunk_len = s_end - s_start;
+    const int this_chunk_len = min(chunk_size, S - s_start);
 
-    // Base pointers for contiguous layouts
-    // dt[b, s, h] linear index = ((b*S) + s)*H + h
-    // const int64_t dt_b_base = static_cast<int64_t>(b) * S * H;
-
-    // out[b, chunk_id, h, c] linear index = (((b*n_chunks)+chunk_id)*H + h)*chunk_size + c
     const int n_chunks = DIV_UP(S, chunk_size);
 
     // gather scalars per head
     const float A_h = A[h];
     const float bias_h = __half2float(dt_bias[h]);
 
-    // For now, do a simple serial pass per (b, h, chunk) in a single thread for correctness.
-    // We'll replace this with a parallel scan later.
+    // TODO: support chunk size != block size
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    constexpr int WARPS = Params::THREADS / 32;
+    __shared__ float warp_sums[WARPS];
+
+    // compute dt_val (masked for tail) and write dt_out
+    float dt_val = 0.f;
+    if (tid < this_chunk_len) {
+        const int s = s_start + tid;
+        const int64_t dt_idx = ((static_cast<int64_t>(b) * S + s) * H + h);
+        dt_val = __half2float(dt[dt_idx]) + bias_h;
+        if (dt_softplus) dt_val = softplusf(dt_val);
+        // store dt_out[b,h,chunk,tid]
+        const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + tid;
+        dt_out[out_idx] = dt_val;
+    } else {
+        // ensure padded tail is deterministic zero
+        const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + tid;
+        if (tid < chunk_size) dt_out[out_idx] = 0.f;
+    }
+
+    // local value to scan
+    float v = (tid < this_chunk_len) ? (dt_val * A_h) : 0.f;
+
+    // intra-warp inclusive scan
+    unsigned mask = 0xffffffffu;
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        float n = __shfl_up_sync(mask, v, offset);
+        if (lane >= offset) v += n;
+    }
+
+    // TODO: fix for chunk_size != block_size
+    // compute warp total robustly (handle partial last warp)
+    const int warp_base = warp_id * 32;
+    int local_count = this_chunk_len - warp_base;
+    if (local_count < 0) local_count = 0;
+    if (local_count > 32) local_count = 32;
+    float warp_total = (local_count > 0) ? __shfl_sync(mask, v, local_count - 1) : 0.f;
+
+    // one thread per warp stores total
+    if (lane == 0) warp_sums[warp_id] = warp_total;
+    __syncthreads();
+
+    // small serial prefix over warps (W <= 8 here)
     if (threadIdx.x == 0) {
-        float acc = 0.f;
-        for (int c = 0; c < this_chunk_len; ++c) {
-            const int s = s_start + c;
-            const int64_t dt_idx = ((static_cast<int64_t>(b) * S + s) * H + h);
-            float dt_val = __half2float(dt[dt_idx]);
-
-            // + dt_bias
-            dt_val += bias_h;
-
-            // softplus if requested
-            if (dt_softplus) {
-                dt_val = softplusf(dt_val);
-            }
-
-            // TODO: clamp dt_val
-
-            // store dt_out (fp32)
-            const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + c;
-            dt_out[out_idx] = dt_val;
-
-            // dA cumsum
-            acc += dt_val * A_h;
-            dA_cumsum[out_idx] = acc;
+        float accw = 0.f;
+        #pragma unroll
+        for (int w = 0; w < WARPS; ++w) {
+            float t = warp_sums[w];
+            accw += t;
+            warp_sums[w] = accw;  // inclusive
         }
-        // tail of the chunk (if any) remains zero because we pre-zero the outputs
+    }
+    __syncthreads();
+
+    // add prefix of previous warps
+    float warp_prefix = (warp_id == 0) ? 0.f : warp_sums[warp_id - 1];
+    v += warp_prefix;
+
+    // write dA_cumsum
+    const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + tid;
+    if (tid < this_chunk_len) {
+        dA_cumsum[out_idx] = v;
+    } else if (tid < chunk_size) {
+        dA_cumsum[out_idx] = 0.f;
     }
 }
+
 
 // ---------- public entry ----------
 std::tuple<at::Tensor, at::Tensor> mamba2_fused_ssd_combined_fwd(

@@ -7,7 +7,7 @@ if not CHECK_CORRECTNESS:
 
 BENCHMARK_REPEATS = 200
 
-CHUNK_SIZE_ORIGINAL=256
+CHUNK_SIZE_ORIGINAL=128#256
 CHUNK_SIZE_FUSED=128
 
 
@@ -17,6 +17,7 @@ have_cu_seqlens     = False # TODO: test
 have_dt_softplus    = True # TODO: test more
 
 
+import math
 import random
 import torch
 
@@ -24,17 +25,72 @@ import triton
 import numpy as np
 
 from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
+
+import mamba2_fused as mf  # compiled C++ CUDA extension
+
+def _mamba_cpp_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+    """
+    Adapter around the C++/CUDA fused implementation.
+    Replace 'mf.ssd_combined_fwd' with your actual bound function name/signature.
+    It should return: (out, out_x, dt, dA_cumsum, states, final_states)
+    """
+    if not hasattr(mf, "ssd_combined_fwd"):
+        raise NotImplementedError(
+            "mamba2_fused.ssd_combined_fwd(...) is not defined. "
+            "Bind your C++ kernel with a matching signature and update this adapter."
+        )
+    return mf.ssd_combined_fwd(
+        x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus
+    )
+
+# TODO: remove this import
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, mamba2_fusion_type="unfused")
-    if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
-        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
-    return outputs
+    # NOW: “Original” == Triton fused path
+    # outputs = _mamba_chunk_scan_combined_fwd(
+    #     x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus,
+    #     mamba2_fusion_type="medium"  # <-- was "unfused"; flipped to fused
+    # )
+    # if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+    #     outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+    # return outputs
+
+    # for quick testing
+    # return x.clone()
+    dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias, dt_softplus)
+    return dA_cumsum, dt_out
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, mamba2_fusion_type="medium")
-    if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
-        outputs = outputs[0], outputs[1], None, None, None, outputs[5]
-    return outputs
+    # NOW: “Fused” == C++ compiled op
+    # outputs = _mamba_cpp_combined_fwd(
+    #     x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus
+    # )
+    # if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+    #     outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+    # return outputs
+
+    # for quick testing
+    outputs = _mamba_cpp_combined_fwd(
+        x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus
+    )
+    # C++ now returns (dA_cumsum, dt_out)
+    dA_cumsum, dt_out = outputs
+    return dA_cumsum, dt_out
+    # return outputs[0]
+
+
+
+# def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+#     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, mamba2_fusion_type="unfused")
+#     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+#         outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+#     return outputs
+
+# def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
+#     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, mamba2_fusion_type="medium")
+#     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
+#         outputs = outputs[0], outputs[1], None, None, None, outputs[5]
+#     return outputs
 
 things_to_compare = [
     (run_original_ssd, "Original", "blue"),
@@ -162,7 +218,16 @@ def run_unit_test(seqlen):
         # compare all to the first
         for i in range(1, len(outputs_full), 1):
             outputs_i = outputs_full[i][field_idx]
+
+            # TODO: remove
+            assert outputs_0.shape[2] == int(math.ceil(float(seqlen) / CHUNK_SIZE_ORIGINAL))
+            skip_size = seqlen % CHUNK_SIZE_ORIGINAL
+            # zero the skip part of each
+            outputs_0[:, :, -1, skip_size:] = 0
+            outputs_i[:, :, -1, skip_size:] = 0
+
             print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
+            print(f"ref stride: {outputs_0.stride()}, test stride: {outputs_i.stride()}")
             atol = 2.5e-3
             rtol = 1e-2
             outputs_i = outputs_i.to(outputs_0.dtype)
@@ -173,12 +238,12 @@ def run_unit_test(seqlen):
                 bad_i = i
             max_diff_idx = torch.argmax(torch.abs(outputs_i - outputs_0))
             max_diff = torch.abs(outputs_i.reshape(-1)[max_diff_idx] - outputs_0.reshape(-1)[max_diff_idx])
-            print(f"max diff: {max_diff} for {max_diff_idx} index, a: {outputs_i.reshape(-1)[max_diff_idx]}, b: {outputs_0.reshape(-1)[max_diff_idx]}")
+            print(f"max diff: {max_diff} for {max_diff_idx} index, test: {outputs_i.reshape(-1)[max_diff_idx]}, ref: {outputs_0.reshape(-1)[max_diff_idx]}")
             max_allowed_diff = atol + rtol * torch.abs(outputs_0)
             max_diff_frac = torch.abs(outputs_i - outputs_0) / max_allowed_diff
             max_rdiff_idx = torch.argmax(max_diff_frac)
             max_rdiff = max_diff_frac.reshape(-1)[max_rdiff_idx]
-            print(f"max diff score: {max_rdiff} for {max_rdiff_idx} index, a: {outputs_i.reshape(-1)[max_rdiff_idx]}, b: {outputs_0.reshape(-1)[max_rdiff_idx]}")
+            print(f"max diff score: {max_rdiff} for {max_rdiff_idx} index, test: {outputs_i.reshape(-1)[max_rdiff_idx]}, ref: {outputs_0.reshape(-1)[max_rdiff_idx]}")
             fail_bools = torch.abs(outputs_i - outputs_0) > atol + rtol * torch.abs(outputs_0)
             fail_bool_num = fail_bools.sum().cpu().item()
             total_elems = outputs_0.numel()

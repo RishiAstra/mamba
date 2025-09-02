@@ -5,7 +5,7 @@ nvcc_args = [
     "-O3",
     "-lineinfo",
     # TODO: check if fast math is ok
-    # "--use_fast_math",
+    "--use_fast_math",
     # TODO: decide what architectures to support
     "-gencode=arch=compute_89,code=sm_89",
 ]

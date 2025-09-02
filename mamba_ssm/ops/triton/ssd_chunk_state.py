@@ -20,13 +20,13 @@ def init_to_zero(names):
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_H': 1}),
-        triton.Config({'BLOCK_SIZE_H': 2}),
+        # triton.Config({'BLOCK_SIZE_H': 1}),
+        # triton.Config({'BLOCK_SIZE_H': 2}),
         triton.Config({'BLOCK_SIZE_H': 4}),
-        triton.Config({'BLOCK_SIZE_H': 8}),
-        triton.Config({'BLOCK_SIZE_H': 16}),
-        triton.Config({'BLOCK_SIZE_H': 32}),
-        triton.Config({'BLOCK_SIZE_H': 64}),
+        # triton.Config({'BLOCK_SIZE_H': 8}),
+        # triton.Config({'BLOCK_SIZE_H': 16}),
+        # triton.Config({'BLOCK_SIZE_H': 32}),
+        # triton.Config({'BLOCK_SIZE_H': 64}),
     ],
     key=['chunk_size', 'nheads'],
 )

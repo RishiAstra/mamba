@@ -9,11 +9,12 @@
 #define DIV_UP(a, b) (((a) + (b) - 1) / (b))
 
 // Compile-time tuning bag (we'll keep CHUNK_SIZE unused for now; runtime param is passed)
-template <uint32_t CHUNK_SIZE_, uint32_t THREADS_, uint32_t TARGET_BLOCKS_>
+template <uint32_t CHUNK_SIZE_, uint32_t THREADS_, uint32_t TARGET_BLOCKS_, uint32_t CUMSUM_H_BLOCK_>
 struct ssd_template_params {
     static constexpr uint32_t CHUNK_SIZE     = CHUNK_SIZE_;
     static constexpr uint32_t THREADS        = THREADS_;
     static constexpr uint32_t TARGET_BLOCKS  = TARGET_BLOCKS_;
+    static constexpr uint32_t CUMSUM_H_BLOCK = CUMSUM_H_BLOCK_;
     static_assert(THREADS % 32 == 0, "THREADS must be a multiple of 32");
 };
 
@@ -33,59 +34,149 @@ void mamba2_ssd_step1_dt_transform_cumsum_kernel(
     const float*  __restrict__ A,      // [H]
     const __half* __restrict__ dt_bias,// [H]
     int B, int S, int H,
-    int chunk_size,
     bool dt_softplus,
     float* __restrict__ dt_out,        // [B, H, n_chunks, chunk_size] fp32
     float* __restrict__ dA_cumsum      // same shape
 ) {
+    static_assert(Params::CHUNK_SIZE >= Params::CUMSUM_H_BLOCK);
+    static_assert(32 >= Params::CUMSUM_H_BLOCK);
+
+    const int tid  = threadIdx.x;
+
+    // mask off if too many threads
+    constexpr uint32_t N_THREADS = (Params::THREADS <= Params::CHUNK_SIZE) ? Params::THREADS : Params::CHUNK_SIZE;
+    if (tid >= N_THREADS) return; // out of range
+
     const int b = blockIdx.y;
     const int chunk_id = blockIdx.x;
-    const int h = blockIdx.z;
+    const int h_base = blockIdx.z * Params::CUMSUM_H_BLOCK;
 
-    if (b >= B || h >= H) return;
+    if (b >= B || h_base >= H) return;
 
-    const int s_start = chunk_id * chunk_size;
+    const int s_start = chunk_id * Params::CHUNK_SIZE;
     if (s_start >= S) return;
-    const int this_chunk_len = min(chunk_size, S - s_start);
+    const int this_chunk_len = min(Params::CHUNK_SIZE, S - s_start);
 
-    const int n_chunks = DIV_UP(S, chunk_size);
+    const int n_chunks = DIV_UP(S, Params::CHUNK_SIZE);
 
-    // gather scalars per head
-    const float A_h = A[h];
-    const float bias_h = __half2float(dt_bias[h]);
 
-    // TODO: support chunk size != block size
-    const int tid  = threadIdx.x;
+    __shared__ float shared_A_h[Params::CUMSUM_H_BLOCK];
+    __shared__ float shared_bias_h[Params::CUMSUM_H_BLOCK];
+    float A_h[Params::CUMSUM_H_BLOCK];
+    float bias_h[Params::CUMSUM_H_BLOCK];
+    constexpr int WARPS = N_THREADS / 32;
+    __shared__ float warp_sums[WARPS][Params::CUMSUM_H_BLOCK];
     const int lane = tid & 31;
     const int warp_id = tid >> 5;
-    constexpr int WARPS = Params::THREADS / 32;
-    __shared__ float warp_sums[WARPS];
+    float v[Params::CUMSUM_H_BLOCK];
+    __shared__ half dt_block[Params::CUMSUM_H_BLOCK][Params::CHUNK_SIZE];
 
-    // compute dt_val (masked for tail) and write dt_out
-    float dt_val = 0.f;
-    if (tid < this_chunk_len) {
-        const int s = s_start + tid;
-        const int64_t dt_idx = ((static_cast<int64_t>(b) * S + s) * H + h);
-        dt_val = __half2float(dt[dt_idx]) + bias_h;
-        if (dt_softplus) dt_val = softplusf(dt_val);
-        // store dt_out[b,h,chunk,tid]
-        const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + tid;
-        dt_out[out_idx] = dt_val;
+    if constexpr(Params::CUMSUM_H_BLOCK == 1) {
+        A_h[0] = A[h_base];
+        bias_h[0] = __half2float(dt_bias[h_base]);
     } else {
-        // ensure padded tail is deterministic zero
-        const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + tid;
-        if (tid < chunk_size) dt_out[out_idx] = 0.f;
+        // load in parallel
+        if (tid < Params::CUMSUM_H_BLOCK) {
+            const int h = h_base + tid;
+            if (h < H) {
+                shared_A_h[tid] = A[h];
+                shared_bias_h[tid] = __half2float(dt_bias[h]);
+            }
+        }
+        // load dt block
+        if constexpr (Params::CUMSUM_H_BLOCK == 4) {
+            // Each thread copies multiple s positions for this (b, chunk, h_base..h_base+3)
+            for (uint32_t s_off = threadIdx.x; s_off < Params::CHUNK_SIZE; s_off += N_THREADS) {
+                const int s = s_start + static_cast<int>(s_off);
+                if (s >= S) {
+                    // zero pad tail
+                    #pragma unroll
+                    for (int hh = 0; hh < 4; ++hh) {
+                        if (h_base + hh < H) dt_block[hh][s_off] = __float2half(0.f);
+                    }
+                    continue;
+                }
+                const int h0 = h_base;
+                const __half* p = dt + ((static_cast<int64_t>(b) * S + s) * H + h0);
+
+                // Fast path: we can read 4 consecutive heads as two __half2 loads
+                if (h0 + 3 < H && ((reinterpret_cast<uintptr_t>(p) & 0x3) == 0)) {
+                    uint64_t v64 = __ldcg(reinterpret_cast<const uint64_t*>(p));
+
+                    uint32_t lo = static_cast<uint32_t>(v64);
+                    uint32_t hi = static_cast<uint32_t>(v64 >> 32);
+
+                    __half2 v01, v23;
+                    memcpy(&v01, &lo, 4);   // h0, h0+1
+                    memcpy(&v23, &hi, 4);   // h0+2, h0+3
+
+                    dt_block[0][s_off] = __low2half(v01);
+                    dt_block[1][s_off] = __high2half(v01);
+                    dt_block[2][s_off] = __low2half(v23);
+                    dt_block[3][s_off] = __high2half(v23);
+                } else {
+                    // Fallback: scalar (handles edges / misalignment)
+                    #pragma unroll
+                    for (int hh = 0; hh < 4; ++hh) {
+                        const int h = h0 + hh;
+                        dt_block[hh][s_off] = (h < H) ? p[hh] : __float2half(0.f);
+                    }
+                }
+            }
+        } else {
+            for (uint32_t id = tid; id < Params::CHUNK_SIZE * Params::CUMSUM_H_BLOCK; id += N_THREADS) {
+                const int s_off = id % Params::CHUNK_SIZE;
+                const int s = s_start + s_off;
+                const int h_off = id / Params::CHUNK_SIZE;
+                const int h = h_base + h_off;
+                if (h < H && s < S) {
+                    const int64_t dt_idx = ((static_cast<int64_t>(b) * S + s) * H + h);
+                    dt_block[h_off][s_off] = dt[dt_idx];
+                }
+            }
+        }
+        __syncthreads();
+
+        // get local copy, won't be modified from now on
+        #pragma unroll
+        for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) {
+            const int h = h_base + rep;
+            if (h < H) {
+                A_h[rep] = shared_A_h[rep];
+                bias_h[rep] = shared_bias_h[rep];
+            }
+        }
     }
 
-    // local value to scan
-    float v = (tid < this_chunk_len) ? (dt_val * A_h) : 0.f;
+    // TODO: support chunk size != block size
+    #pragma unroll
+    for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) {
+        const int h = h_base + rep;
+        // compute dt_val (masked for tail) and write dt_out
+        float dt_val = 0.f;
+        if (tid < this_chunk_len) {
+            dt_val = __half2float(dt_block[rep][tid]) + bias_h[rep]; // TODO: support less threads than chunk size
+            if (dt_softplus) dt_val = softplusf(dt_val);
+            // store dt_out[b,h,chunk,tid]
+            const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * Params::CHUNK_SIZE + tid;
+            dt_out[out_idx] = dt_val;
+        } else {
+            // ensure padded tail is deterministic zero
+            const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * Params::CHUNK_SIZE + tid;
+            if (tid < Params::CHUNK_SIZE) dt_out[out_idx] = 0.f;
+        }
+        v[rep] = (tid < this_chunk_len) ? (dt_val * A_h[rep]) : 0.f;
+    }
 
     // intra-warp inclusive scan
     unsigned mask = 0xffffffffu;
     #pragma unroll
     for (int offset = 1; offset < 32; offset <<= 1) {
-        float n = __shfl_up_sync(mask, v, offset);
-        if (lane >= offset) v += n;
+        #pragma unroll
+        for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) {
+            float n = __shfl_up_sync(mask, v[rep], offset);
+            if (lane >= offset) v[rep] += n;
+        }
     }
 
     // TODO: fix for chunk_size != block_size
@@ -94,34 +185,39 @@ void mamba2_ssd_step1_dt_transform_cumsum_kernel(
     int local_count = this_chunk_len - warp_base;
     if (local_count < 0) local_count = 0;
     if (local_count > 32) local_count = 32;
-    float warp_total = (local_count > 0) ? __shfl_sync(mask, v, local_count - 1) : 0.f;
+    float warp_total[Params::CUMSUM_H_BLOCK];
+    #pragma unroll
+    for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) warp_total[rep] = (local_count > 0) ? __shfl_sync(mask, v[rep], local_count - 1) : 0.f;
+    if (lane < Params::CUMSUM_H_BLOCK) warp_sums[warp_id][lane] = warp_total[lane];
 
-    // one thread per warp stores total
-    if (lane == 0) warp_sums[warp_id] = warp_total;
+    // second stage gets across warps
     __syncthreads();
-
     // small serial prefix over warps (W <= 8 here)
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < Params::CUMSUM_H_BLOCK) {
         float accw = 0.f;
         #pragma unroll
         for (int w = 0; w < WARPS; ++w) {
-            float t = warp_sums[w];
+            float t = warp_sums[w][threadIdx.x];
             accw += t;
-            warp_sums[w] = accw;  // inclusive
+            warp_sums[w][threadIdx.x] = accw;  // inclusive
         }
     }
     __syncthreads();
 
-    // add prefix of previous warps
-    float warp_prefix = (warp_id == 0) ? 0.f : warp_sums[warp_id - 1];
-    v += warp_prefix;
+    #pragma unroll
+    for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) {
+        const int h = h_base + rep;
+        // add prefix of previous warps
+        float warp_prefix = (warp_id == 0) ? 0.f : warp_sums[warp_id - 1][rep];
+        v[rep] += warp_prefix;
 
-    // write dA_cumsum
-    const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * chunk_size + tid;
-    if (tid < this_chunk_len) {
-        dA_cumsum[out_idx] = v;
-    } else if (tid < chunk_size) {
-        dA_cumsum[out_idx] = 0.f;
+        // write dA_cumsum
+        const int64_t out_idx = ((static_cast<int64_t>(b) * H + h) * n_chunks + chunk_id) * Params::CHUNK_SIZE + tid;
+        if (tid < this_chunk_len) {
+            dA_cumsum[out_idx] = v[rep];
+        } else if (tid < Params::CHUNK_SIZE) {
+            dA_cumsum[out_idx] = 0.f;
+        }
     }
 }
 
@@ -163,17 +259,23 @@ std::tuple<at::Tensor, at::Tensor> mamba2_fused_ssd_combined_fwd(
     TORCH_CHECK(dt_bias.sizes() == at::IntArrayRef({H}),    "dt_bias must be [H]");
     TORCH_CHECK(chunk_size > 0, "chunk_size must be > 0");
 
-    const int n_chunks = DIV_UP(S, static_cast<int>(chunk_size));
+    // TODO: compile multiple versions, for different config
+    assert(chunk_size == 128);
+    int chunk_size_int = static_cast<int>(chunk_size);
+
+    // NOTE: we do not check for ptr overlap, since it would be crazy to overlap stuff like x and A
+
+    const int n_chunks = DIV_UP(S, chunk_size_int);
 
     // --- allocate outputs for step 1 (fp32) ---
     auto opts_f = at::TensorOptions().dtype(at::kFloat).device(dev);
-    auto dt_out    = at::empty({Bsz, H, n_chunks, static_cast<int>(chunk_size)}, opts_f);
+    auto dt_out    = at::empty({Bsz, H, n_chunks, chunk_size_int}, opts_f);
     auto dA_cumsum = at::empty_like(dt_out);
 
     // --- launch kernel (correctness-first mapping: 1 head per block) ---
-    using Params = ssd_template_params</*CHUNK_SIZE*/0, /*THREADS*/128, /*TARGET_BLOCKS*/4>;
+    using Params = ssd_template_params</*CHUNK_SIZE*/128, /*THREADS*/128, /*TARGET_BLOCKS*/4, /*CUMSUM_H_BLOCK*/4>;
     dim3 block(Params::THREADS);
-    dim3 grid(n_chunks, Bsz, H);
+    dim3 grid(n_chunks, Bsz, DIV_UP(H, Params::CUMSUM_H_BLOCK));
     auto stream = at::cuda::getCurrentCUDAStream();
 
     mamba2_ssd_step1_dt_transform_cumsum_kernel<Params><<<grid, block, 0, stream>>>(
@@ -181,7 +283,6 @@ std::tuple<at::Tensor, at::Tensor> mamba2_fused_ssd_combined_fwd(
         A.data_ptr<float>(),
         reinterpret_cast<const __half*>(dt_bias.data_ptr<at::Half>()),
         Bsz, S, H,
-        static_cast<int>(chunk_size),
         dt_softplus,
         dt_out.data_ptr<float>(),
         dA_cumsum.data_ptr<float>()

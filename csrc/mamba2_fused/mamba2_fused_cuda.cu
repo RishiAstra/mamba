@@ -100,20 +100,13 @@ void mamba2_ssd_step1_dt_transform_cumsum_kernel(
                 const __half* p = dt + ((static_cast<int64_t>(b) * S + s) * H + h0);
 
                 // Fast path: we can read 4 consecutive heads as two __half2 loads
-                if (h0 + 3 < H && ((reinterpret_cast<uintptr_t>(p) & 0x3) == 0)) {
+                if (h0 + 3 < H && ((reinterpret_cast<uintptr_t>(p) & 0x7) == 0)) { // align to 8B to match type
                     uint64_t v64 = __ldcg(reinterpret_cast<const uint64_t*>(p));
 
-                    uint32_t lo = static_cast<uint32_t>(v64);
-                    uint32_t hi = static_cast<uint32_t>(v64 >> 32);
-
-                    __half2 v01, v23;
-                    memcpy(&v01, &lo, 4);   // h0, h0+1
-                    memcpy(&v23, &hi, 4);   // h0+2, h0+3
-
-                    dt_block[0][s_off] = __low2half(v01);
-                    dt_block[1][s_off] = __high2half(v01);
-                    dt_block[2][s_off] = __low2half(v23);
-                    dt_block[3][s_off] = __high2half(v23);
+                    dt_block[0][s_off] = __ushort_as_half(static_cast<uint16_t>(v64 & 0xFFFF));
+                    dt_block[1][s_off] = __ushort_as_half(static_cast<uint16_t>((v64 >> 16) & 0xFFFF));
+                    dt_block[2][s_off] = __ushort_as_half(static_cast<uint16_t>((v64 >> 32) & 0xFFFF));
+                    dt_block[3][s_off] = __ushort_as_half(static_cast<uint16_t>((v64 >> 48) & 0xFFFF));
                 } else {
                     // Fallback: scalar (handles edges / misalignment)
                     #pragma unroll

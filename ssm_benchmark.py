@@ -40,7 +40,7 @@ def _mamba_cpp_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_s
             "Bind your C++ kernel with a matching signature and update this adapter."
         )
     return mf.ssd_combined_fwd(
-        x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus
+        x, dt, A, B, C, D, dt_softplus, chunk_size, z, dt_bias, initial_states, seq_idx, cu_seqlens
     )
 
 # TODO: remove this import
@@ -58,7 +58,7 @@ def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, 
     # for quick testing
     # return x.clone()
     dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias, dt_softplus)
-    return dA_cumsum, dt_out
+    return None, None, dt_out, dA_cumsum, None, None
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     # NOW: “Fused” == C++ compiled op
@@ -69,16 +69,10 @@ def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq
     #     outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     # return outputs
 
-    # for quick testing
-    outputs = _mamba_cpp_combined_fwd(
+    # for quick testing, currently only returns some stuff (step 1)
+    return _mamba_cpp_combined_fwd(
         x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus
     )
-    # C++ now returns (dA_cumsum, dt_out)
-    dA_cumsum, dt_out = outputs
-    return dA_cumsum, dt_out
-    # return outputs[0]
-
-
 
 # def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
 #     outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, mamba2_fusion_type="unfused")

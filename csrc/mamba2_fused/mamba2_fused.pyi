@@ -9,23 +9,29 @@ def ssd_combined_fwd(
     A: Tensor,
     B: Tensor,
     C: Tensor,
-    chunk_size: int,
     D: Tensor,
+    dt_softplus: bool,
+    chunk_size: int,
     z: Optional[Tensor],
-    dt_bias: Tensor,
+    dt_bias: Optional[Tensor],
     initial_states: Optional[Tensor],
     seq_idx: Optional[Tensor],
     cu_seqlens: Optional[Tensor],
-    dt_softplus: bool,
+    out: Optional[Tensor],
+    out_x: Optional[Tensor],
+    dt_out: Optional[Tensor],
+    dA_cumsum: Optional[Tensor],
+    states: Optional[Tensor],
+    final_states: Optional[Tensor],
     /,
 ) -> Tuple[
-    Tensor,    # out
-    Tensor,    # out_x
-    Optional[Tensor],   # dt (may be None depending on path)
-    Optional[Tensor],   # dA_cumsum (may be None)
-    Optional[Tensor],   # states (may be None)
-    Tensor,    # final_states
+    Optional[Tensor],    # out
+    Optional[Tensor],    # out_x
+    Optional[Tensor],   # dt
+    Optional[Tensor],   # dA_cumsum
+    Optional[Tensor],   # states
+    Optional[Tensor],    # final_states
 ]:
     """
-    Fused Mamba SSD forward (C++/CUDA), not fully implemented yet.
+    Fused Mamba SSD forward (C++/CUDA), not fully implemented yet (some outputs will be None).
     """

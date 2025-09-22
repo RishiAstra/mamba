@@ -18,6 +18,9 @@ struct Mamba2SSDArgs {
     const bool    dt_softplus;
     const int64_t chunk_size;
 
+    // control CB dtype (false = 16-bit; true = fp32)
+    const bool    cb_force_fp32 = false;
+
     // Optional tensors
     const c10::optional<at::Tensor> z;              // [B, S, H, headdim] (Half)
     const c10::optional<at::Tensor> dt_bias;        // [H]                (Half)
@@ -41,6 +44,8 @@ struct Mamba2SSDArgs {
     at::Tensor dA_cumsum;
     at::Tensor states;
     at::Tensor final_states;
+    // intermediate
+    at::Tensor CB;
 
     // Explicit constructor with default optionals
     Mamba2SSDArgs(
@@ -52,17 +57,22 @@ struct Mamba2SSDArgs {
         at::Tensor D,
         bool dt_softplus = false,
         int64_t chunk_size = 128,
+        bool cb_force_fp32 = false,
+        // optionals
         c10::optional<at::Tensor> z = c10::nullopt,
         c10::optional<at::Tensor> dt_bias = c10::nullopt,
         c10::optional<at::Tensor> initial_states = c10::nullopt,
         c10::optional<at::Tensor> seq_idx = c10::nullopt,
         c10::optional<at::Tensor> cu_seqlens = c10::nullopt,
+        // optional preallocated outputs
         c10::optional<at::Tensor> out = c10::nullopt,
         c10::optional<at::Tensor> out_x = c10::nullopt,
         c10::optional<at::Tensor> dt_out = c10::nullopt,
         c10::optional<at::Tensor> dA_cumsum = c10::nullopt,
         c10::optional<at::Tensor> states = c10::nullopt,
-        c10::optional<at::Tensor> final_states = c10::nullopt
+        c10::optional<at::Tensor> final_states = c10::nullopt,
+        // optional preallocated intermediate
+        c10::optional<at::Tensor> CB = c10::nullopt
     )
     : x(std::move(x))
     , dt(std::move(dt))
@@ -72,6 +82,7 @@ struct Mamba2SSDArgs {
     , D(std::move(D))
     , dt_softplus(dt_softplus)
     , chunk_size(chunk_size)
+    , cb_force_fp32(cb_force_fp32)
     , z(std::move(z))
     , dt_bias(std::move(dt_bias))
     , initial_states(std::move(initial_states))
@@ -84,8 +95,9 @@ struct Mamba2SSDArgs {
             std::move(dt_out),
             std::move(dA_cumsum),
             std::move(states),
-            std::move(final_states)
-        ); // TODO: can pass in preallocated outputs
+            std::move(final_states),
+            std::move(CB)
+        );
     }
 
     void verify_and_init(
@@ -94,13 +106,13 @@ struct Mamba2SSDArgs {
         c10::optional<at::Tensor> dt_out_ = c10::nullopt,
         c10::optional<at::Tensor> dA_cumsum_ = c10::nullopt,
         c10::optional<at::Tensor> states_ = c10::nullopt,
-        c10::optional<at::Tensor> final_states_ = c10::nullopt
+        c10::optional<at::Tensor> final_states_ = c10::nullopt,
+        c10::optional<at::Tensor> CB_ = c10::nullopt
     ) {
         // ---- defined ----
         TORCH_CHECK(x.defined() && dt.defined() && A.defined() &&
                     B.defined() && C.defined() && D.defined(),
                     "all required tensors (x, dt, A, B, C, D) must be defined");
-
 
         // optional tensors
         bool has_z = z && z->defined();
@@ -108,7 +120,6 @@ struct Mamba2SSDArgs {
         bool has_initial_states = initial_states && initial_states->defined();
         bool has_seq_idx = seq_idx && seq_idx->defined();
         bool has_cu_seqlens = cu_seqlens && cu_seqlens->defined();
-
 
         // ---- dtypes ----
         TORCH_CHECK(x.scalar_type()       == at::kHalf,  "x must be float16");
@@ -164,7 +175,6 @@ struct Mamba2SSDArgs {
         TORCH_CHECK(H > 0, "H must be > 0");
         TORCH_CHECK(ngroups > 0 && ngroups <= H, "ngroups must be in [1, H]");
         TORCH_CHECK(H % ngroups == 0, "H must be divisible by ngroups");
-
 
         // ---- shape compat checks ----
         TORCH_CHECK(x.size(0) == Bsz && x.size(1) == S && x.size(2) == H && x.size(3) == headdim,
@@ -243,99 +253,100 @@ struct Mamba2SSDArgs {
         if (has_cu_seqlens) TORCH_CHECK(cu_seqlens->device() == dev,
                     "cu_seqlens must be on the same device as x if provided");
 
-        auto opts = at::TensorOptions().dtype(at::kFloat).device(dev);
-
+        auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(dev);
 
         // ---- alloc outputs if not provided ----
         if (!out_ || !out_->defined()) {
-            out = at::empty({Bsz, S, H, headdim}, opts);
+            out = at::empty({Bsz, S, H, headdim}, opts_f32);
         } else {
             out = std::move(*out_);
             TORCH_CHECK(out.device() == dev, "out device mismatch");
             TORCH_CHECK(out.scalar_type() == at::kFloat, "out must be float32");
-            TORCH_CHECK(out.dim() == 4 &&
-                        out.size(0) == Bsz &&
-                        out.size(1) == S &&
-                        out.size(2) == H &&
-                        out.size(3) == headdim,
+            TORCH_CHECK(out.dim() == 4 && out.sizes().equals(at::IntArrayRef{Bsz, S, H, headdim}),
                         "out must be [B, S, H, headdim]");
             TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
         }
 
         if (!out_x_ || !out_x_->defined()) {
-            out_x = at::empty({Bsz, S, H, headdim}, opts);
+            out_x = at::empty({Bsz, S, H, headdim}, opts_f32);
         } else {
             out_x = std::move(*out_x_);
             TORCH_CHECK(out_x.device() == dev, "out_x device mismatch");
             TORCH_CHECK(out_x.scalar_type() == at::kFloat, "out_x must be float32");
-            TORCH_CHECK(out_x.dim() == 4 &&
-                        out_x.size(0) == Bsz &&
-                        out_x.size(1) == S &&
-                        out_x.size(2) == H &&
-                        out_x.size(3) == headdim,
+            TORCH_CHECK(out_x.dim() == 4 && out_x.sizes().equals(at::IntArrayRef{Bsz, S, H, headdim}),
                         "out_x must be [B, S, H, headdim]");
             TORCH_CHECK(out_x.is_contiguous(), "out_x must be contiguous");
         }
 
         if (!dt_out_ || !dt_out_->defined()) {
-            dt_out = at::empty({Bsz, H, n_chunks, chunk_size}, opts);
+            dt_out = at::empty({Bsz, H, n_chunks, chunk_size}, opts_f32);
         } else {
             dt_out = std::move(*dt_out_);
             TORCH_CHECK(dt_out.device() == dev, "dt_out device mismatch");
             TORCH_CHECK(dt_out.scalar_type() == at::kFloat, "dt_out must be float32");
-            TORCH_CHECK(dt_out.dim() == 4 &&
-                        dt_out.size(0) == Bsz &&
-                        dt_out.size(1) == H &&
-                        dt_out.size(2) == n_chunks &&
-                        dt_out.size(3) == chunk_size,
+            TORCH_CHECK(dt_out.dim() == 4 && dt_out.sizes().equals(at::IntArrayRef{Bsz, H, n_chunks, chunk_size}),
                         "dt_out must be [B, H, n_chunks, chunk_size]");
             TORCH_CHECK(dt_out.is_contiguous(), "dt_out must be contiguous");
         }
 
         if (!dA_cumsum_ || !dA_cumsum_->defined()) {
-            dA_cumsum = at::empty({Bsz, H, n_chunks, chunk_size}, opts);
+            dA_cumsum = at::empty({Bsz, H, n_chunks, chunk_size}, opts_f32);
         } else {
             dA_cumsum = std::move(*dA_cumsum_);
             TORCH_CHECK(dA_cumsum.device() == dev, "dA_cumsum device mismatch");
             TORCH_CHECK(dA_cumsum.scalar_type() == at::kFloat, "dA_cumsum must be float32");
-            TORCH_CHECK(dA_cumsum.dim() == 4 &&
-                        dA_cumsum.size(0) == Bsz &&
-                        dA_cumsum.size(1) == H &&
-                        dA_cumsum.size(2) == n_chunks &&
-                        dA_cumsum.size(3) == chunk_size,
+            TORCH_CHECK(dA_cumsum.dim() == 4 && dA_cumsum.sizes().equals(at::IntArrayRef{Bsz, H, n_chunks, chunk_size}),
                         "dA_cumsum must be [B, H, n_chunks, chunk_size]");
             TORCH_CHECK(dA_cumsum.is_contiguous(), "dA_cumsum must be contiguous");
         }
 
         if (!states_ || !states_->defined()) {
-            states = at::empty({Bsz, n_chunks, H, headdim, dstate}, opts);
+            states = at::empty({Bsz, n_chunks, H, headdim, dstate}, opts_f32);
         } else {
             states = std::move(*states_);
             TORCH_CHECK(states.device() == dev, "states device mismatch");
             TORCH_CHECK(states.scalar_type() == at::kFloat, "states must be float32");
-            TORCH_CHECK(states.dim() == 5 &&
-                        states.size(0) == Bsz &&
-                        states.size(1) == n_chunks &&
-                        states.size(2) == H &&
-                        states.size(3) == headdim &&
-                        states.size(4) == dstate,
+            TORCH_CHECK(states.dim() == 5 && states.sizes().equals(at::IntArrayRef{Bsz, n_chunks, H, headdim, dstate}),
                         "states must be [B, n_chunks, H, headdim, dstate]");
             TORCH_CHECK(states.is_contiguous(), "states must be contiguous");
         }
 
         if (!final_states_ || !final_states_->defined()) {
-            final_states = at::empty({Bsz, H, headdim, dstate}, opts);
+            final_states = at::empty({Bsz, H, headdim, dstate}, opts_f32);
         } else {
             final_states = std::move(*final_states_);
             TORCH_CHECK(final_states.device() == dev, "final_states device mismatch");
             TORCH_CHECK(final_states.scalar_type() == at::kFloat, "final_states must be float32");
-            TORCH_CHECK(final_states.dim() == 4 &&
-                        final_states.size(0) == Bsz &&
-                        final_states.size(1) == H &&
-                        final_states.size(2) == headdim &&
-                        final_states.size(3) == dstate,
+            TORCH_CHECK(final_states.dim() == 4 && final_states.sizes().equals(at::IntArrayRef{Bsz, H, headdim, dstate}),
                         "final_states must be [B, H, headdim, dstate]");
             TORCH_CHECK(final_states.is_contiguous(), "final_states must be contiguous");
+        }
+
+        // --------- allocate / validate CB ---------
+        // choose 16-bit dtype when cb_force_fp32 == false (bf16 preferred if any input is bf16)
+        at::ScalarType cb16 = at::kHalf;
+        // TODO: use once bf16 is supported
+        // TODO: might need to support fp32 C and B too
+        // (B.scalar_type() == at::kBFloat16 || C.scalar_type() == at::kBFloat16) ? at::kBFloat16 : at::kHalf;
+        auto cb_opts = at::TensorOptions().dtype(cb_force_fp32 ? at::kFloat : cb16).device(dev);
+
+        std::array<int64_t,5> cb_shape5 = {Bsz, n_chunks, ngroups, chunk_size, chunk_size};
+
+        if (!CB_ || !CB_->defined()) {
+            CB = at::empty(cb_shape5, cb_opts);
+        } else {
+            CB = std::move(*CB_);
+            TORCH_CHECK(CB.device() == dev, "CB device mismatch");
+            TORCH_CHECK(CB.scalar_type() == (cb_force_fp32 ? at::kFloat : cb16),
+                        "CB dtype mismatch with cb_force_fp32 setting");
+            TORCH_CHECK(CB.dim() == 5 &&
+                        CB.size(0) == cb_shape5[0] &&
+                        CB.size(1) == cb_shape5[1] &&
+                        CB.size(2) == cb_shape5[2] &&
+                        CB.size(3) == cb_shape5[3] &&
+                        CB.size(4) == cb_shape5[4],
+                        "CB must be [B, n_chunks, ngroups, chunk_size, chunk_size]");
+            TORCH_CHECK(CB.is_contiguous(), "CB must be contiguous");
         }
     }
 };

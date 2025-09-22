@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "cumsum.h"
+#include "bmm.h"
 
 // Forward decl implemented in the .cu file
 std::tuple<c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>> mamba2_fused_ssd_combined_fwd(
@@ -16,6 +17,7 @@ std::tuple<c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<a
     const at::Tensor& D,
     const bool dt_softplus,
     const int64_t chunk_size,
+    const bool cb_force_fp32,
     const c10::optional<at::Tensor>& z,
     const c10::optional<at::Tensor>& dt_bias,
     const c10::optional<at::Tensor>& initial_states,
@@ -26,17 +28,21 @@ std::tuple<c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<a
     const c10::optional<at::Tensor>& dt_out,
     const c10::optional<at::Tensor>& dA_cumsum,
     const c10::optional<at::Tensor>& states,
-    const c10::optional<at::Tensor>& final_states
+    const c10::optional<at::Tensor>& final_states,
+    const c10::optional<at::Tensor>& CB
 ) {
     Mamba2SSDArgs args{
         x, dt, A, B, C, D,
         dt_softplus, chunk_size,
+        /*cb_force_fp32=*/cb_force_fp32,
         z, dt_bias, initial_states, seq_idx, cu_seqlens,
-        out, out_x, dt_out, dA_cumsum, states, final_states
+        out, out_x, dt_out, dA_cumsum, states, final_states,
+        CB
     };
 
     // for now, we just run cumsum
-    return mamba2_cumsum_fwd_cuda(args);
+    // return mamba2_cumsum_fwd_cuda(args);
+    return mamba2_bmm_chunk_fwd_cuda(args);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -51,6 +57,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("D"),
         pybind11::arg("dt_softplus"),
         pybind11::arg("chunk_size"),
+        pybind11::arg("cb_force_fp32") = false,
         pybind11::arg("z") = pybind11::none(),
         pybind11::arg("dt_bias") = pybind11::none(),
         pybind11::arg("initial_states") = pybind11::none(),
@@ -62,6 +69,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("dA_cumsum") = pybind11::none(),
         pybind11::arg("states") = pybind11::none(),
         pybind11::arg("final_states") = pybind11::none(),
+        pybind11::arg("CB") = pybind11::none(),
         R"doc(
 Returns a 6-tuple: (out, out_x, dt_out, dA_cumsum, states, final_states).
 Currently only (dt_out, dA_cumsum) are populated; the rest are None.

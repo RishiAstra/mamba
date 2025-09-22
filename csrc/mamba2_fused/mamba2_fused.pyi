@@ -12,24 +12,26 @@ def ssd_combined_fwd(
     D: Tensor,
     dt_softplus: bool,
     chunk_size: int,
-    z: Optional[Tensor],
-    dt_bias: Optional[Tensor],
-    initial_states: Optional[Tensor],
-    seq_idx: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    out: Optional[Tensor],
-    out_x: Optional[Tensor],
-    dt_out: Optional[Tensor],
-    dA_cumsum: Optional[Tensor],
-    states: Optional[Tensor],
-    final_states: Optional[Tensor],
+    cb_force_fp32: bool = False,
+    z: Optional[Tensor] = None,
+    dt_bias: Optional[Tensor] = None,
+    initial_states: Optional[Tensor] = None,
+    seq_idx: Optional[Tensor] = None,
+    cu_seqlens: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    out_x: Optional[Tensor] = None,
+    dt_out: Optional[Tensor] = None,
+    dA_cumsum: Optional[Tensor] = None,
+    states: Optional[Tensor] = None,
+    final_states: Optional[Tensor] = None,
+    CB: Optional[Tensor] = None,
     /,
 ) -> Tuple[
     Optional[Tensor],    # out
     Optional[Tensor],    # out_x
-    Optional[Tensor],   # dt
-    Optional[Tensor],   # dA_cumsum
-    Optional[Tensor],   # states
+    Optional[Tensor],    # dt
+    Optional[Tensor],    # dA_cumsum
+    Optional[Tensor],    # states
     Optional[Tensor],    # final_states
 ]:
     """

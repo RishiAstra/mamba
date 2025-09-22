@@ -19,7 +19,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             "mamba2_fused",
-            ["mamba2_fused.cpp", "mamba2_fused_cuda.cu"],
+            ["mamba2_fused.cpp", "mamba2_fused_cuda.cu", "mamba2_bmm.cu"],
             extra_compile_args={
                 "cxx": cxx_args,
                 "nvcc": nvcc_args,

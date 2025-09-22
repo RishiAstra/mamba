@@ -40,11 +40,12 @@ def _mamba_cpp_combined_fwd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_s
             "Bind your C++ kernel with a matching signature and update this adapter."
         )
     return mf.ssd_combined_fwd(
-        x, dt, A, B, C, D, dt_softplus, chunk_size, z, dt_bias, initial_states, seq_idx, cu_seqlens
+        x, dt, A, B, C, D, dt_softplus, chunk_size, False, z, dt_bias, initial_states, seq_idx, cu_seqlens
     )
 
 # TODO: remove this import
 from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd
+from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     # NOW: “Original” == Triton fused path
     # outputs = _mamba_chunk_scan_combined_fwd(
@@ -57,8 +58,15 @@ def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, 
 
     # for quick testing
     # return x.clone()
-    dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias, dt_softplus)
-    return None, None, dt_out, dA_cumsum, None, None
+
+    # # cumsum test
+    # dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias, dt_softplus)
+    # return None, None, dt_out, dA_cumsum, None, None
+
+    # bmm test
+    out = _bmm_chunk_fwd(C, B, chunk_size, seq_idx, False)
+    return out, None, None, None, None, None
+
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
     # NOW: “Fused” == C++ compiled op
@@ -213,12 +221,12 @@ def run_unit_test(seqlen):
         for i in range(1, len(outputs_full), 1):
             outputs_i = outputs_full[i][field_idx]
 
-            # TODO: remove
-            assert outputs_0.shape[2] == int(math.ceil(float(seqlen) / CHUNK_SIZE_ORIGINAL))
-            skip_size = seqlen % CHUNK_SIZE_ORIGINAL
-            # zero the skip part of each
-            outputs_0[:, :, -1, skip_size:] = 0
-            outputs_i[:, :, -1, skip_size:] = 0
+            # TODO: remove, was for skipping padding differences
+            # assert outputs_0.shape[2] == int(math.ceil(float(seqlen) / CHUNK_SIZE_ORIGINAL))
+            # skip_size = seqlen % CHUNK_SIZE_ORIGINAL
+            # # zero the skip part of each
+            # outputs_0[:, :, -1, skip_size:] = 0
+            # outputs_i[:, :, -1, skip_size:] = 0
 
             print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
             print(f"ref stride: {outputs_0.stride()}, test stride: {outputs_i.stride()}")

@@ -42,6 +42,61 @@ template <> struct wmma_prec<__half>         { using type = __half;             
 template <> struct wmma_prec<__nv_bfloat16>  { using type = __nv_bfloat16;                   static constexpr int WMMA_K = 16; };
 template <> struct wmma_prec<float>          { using type = nvcuda::wmma::precision::tf32;   static constexpr int WMMA_K = 8;  };
 
+// Copy a BM/BN x BK tile (row-major line in smem) using 16B vectors where possible.
+// Template params are compile-time tile geometry.
+// Pass ROWS = Param::BM for A, ROWS = Param::BN for B.
+template <typename T, int ROWS, int COLS>
+__device__ __forceinline__ void stage_tile_vec16(
+    const T* __restrict__ g_tile0,   // global ptr at (row0, k0) of this BLOCK tile
+    int64_t g_stride_row,            // global stride (elements) to next row (saS/sbS)
+    int64_t g_stride_k,              // global stride (elements) along K (saK/sbK; usually 1)
+    T* __restrict__ s_tile0,         // shared ptr at (row0, k0) for this BLOCK tile
+    int      s_ld,                   // shared leading dim (elements): A->BK, B(col-major)->thisBK_round
+    int      rows_active,            // min(ROWS, chunk_limit - row0)
+    int      K_rem,                  // min(COLS, K - k0)  (elements remaining from k0)
+    int      warp_id,                // 0..(warps_per_block-1)
+    int      warps_per_block         // blockDim.x / 32
+){
+    constexpr int VBYTES = 4;
+    constexpr int VE     = VBYTES / sizeof(T);           // 1 for fp32, 2 for fp16/bf16
+    constexpr int WARP_ELEMS = VE * 32;                  // elements per full warp vector copy
+    constexpr int ROW_VECS   = DIV_UP(COLS, WARP_ELEMS); // how many 16B vectors per row (full warp)
+    constexpr int TOTAL_VECS = ROWS * ROW_VECS; // TODO: don't idle threads if vector is 2x or more than BK
+
+    const int lane_id = threadIdx.x & 31;
+
+    for (int v = warp_id; v < TOTAL_VECS; v += warps_per_block) {
+        const int r      = v / ROW_VECS;                // 0..ROWS-1 (virtual row)
+        const int c_vec  = v - r * ROW_VECS;            // 0..ROW_VECS-1
+        const int k_off  = c_vec * WARP_ELEMS;          // element offset along K
+
+        T*       s = s_tile0 + r * s_ld + k_off;        // row-major line in smem
+        const T* g = g_tile0 + r * g_stride_row + k_off * g_stride_k;
+
+        const bool row_ok  = (r < rows_active);
+        const bool k_fits  = (k_off + (WARP_ELEMS - 1) < K_rem);
+        const bool contigK  = (g_stride_k == 1);
+        const bool aligned = (((uintptr_t)g & 0x3) == 0) && (((uintptr_t)s & 0x3) == 0); // 4B align (for int32/float)
+
+        if (row_ok && k_fits && contigK && aligned) {
+            // 4B per lane -> 128B per warp
+            reinterpret_cast<int32_t*>(s)[lane_id] = reinterpret_cast<const int32_t*>(g)[lane_id];
+        } else {
+            // slow path: elementwise for this 16B chunk (handles row tail, K tail, misalign)
+            #pragma unroll
+            for (int i = lane_id; i < WARP_ELEMS; i += 32) {
+                const int kk = k_off + i;
+                if (kk < COLS) {
+                    T val = (row_ok && kk < K_rem) ? g[i * g_stride_k] : from_float<T>(0.0f);
+                    s[i] = val; // contiguous along K in smem
+                }
+            }
+        }
+    }
+}
+
+
+// TODO: make sure it works even with K not multiple of BK or WMMA_K; BK not multiple of WMMA_K
 // ---------------- core kernel (WMMA tensor cores) ----------------
 template <typename TA, typename TB, typename TO, typename P>
 __global__ __launch_bounds__(P::THREADS, P::TARGET_BLOCKS)
@@ -110,9 +165,10 @@ void bmm_chunk_wmma_kernel(
 
     // Shared memory: A [BM x BK], B [BK x BN], and per-warp C buffer [16x16]
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    TA* As = reinterpret_cast<TA*>(smem_raw);                          // [BM x BK] row-major
-    TB* Bs = reinterpret_cast<TB*>(As + (size_t)BM * BK);               // [BK x BN] row-major buffer
-    float* Cs = reinterpret_cast<float*>(Bs + (size_t)BK * BN);         // [warps_per_block x 16 x 16]
+    // TODO: align 16B
+    TA* As = reinterpret_cast<TA*>(smem_raw);                           // [BM x BK] row-major
+    TB* Bs = reinterpret_cast<TB*>(As + (size_t)BM * BK);               // [BK x BN] col-major (similar to [BN x BK] row-major)
+    float* Cs = reinterpret_cast<float*>(Bs + (size_t)BK * BN);         // [BM x BN] row-major
 
     const int warp_id = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
@@ -128,111 +184,132 @@ void bmm_chunk_wmma_kernel(
     static_assert(std::is_same_v<TA, TB>, "TA/TB must match for this WMMA path");
     constexpr int WMMA_K = wmma_prec<TA>::WMMA_K;
 
-    // Each warp processes its set of subtiles and accumulates across all K-slabs
-    for (int st = warp_id; st < num_subtiles; st += warps_per_block) {
-        const int tile_m = st / NT;   // 0..MT-1
-        const int tile_n = st % NT;   // 0..NT-1
+    // we need to iterate over K in chunks of BK (otherwise not enough shared memory)
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        // for now, load the whole BK up front
+        const int rowsA    = max(0, min(BM, chunk_limit - m0));
+        const int colsB    = max(0, min(BN, chunk_limit - n0));
+        const int K_rem    = max(0, min(BK, K - k0));
 
-        // Accumulator fragment for this subtile
-        wmma::fragment<wmma::accumulator, 16, 16, WMMA_K, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
+        const TA* g_tileA0 = A_base + (int64_t)m0 * saS + (int64_t)k0 * saK;
+        const TB* g_tileB0 = B_base + (int64_t)n0 * sbS + (int64_t)k0 * sbK;
 
-        // Walk K in slabs of BK
-        for (int k0 = 0; k0 < K; k0 += BK) {
-            const int thisBK = min(BK, K - k0);
-            const int thisBK_round = ((thisBK + WMMA_K - 1) / WMMA_K) * WMMA_K; // pad to WMMA_K
+        TA* s_tileA0 = As;               // row-major, ld = BK
+        TB* s_tileB0 = Bs;               // row-major buffer, ld = BK
 
-            // ---- Stage A [BM x thisBK_round] into shared ----
-            const int a_elems = BM * thisBK_round;
-            for (int idx = threadIdx.x; idx < a_elems; idx += blockDim.x) {
-                const int r = idx / thisBK_round;  // [0..BM)
-                const int c = idx % thisBK_round;  // [0..thisBK_round)
-                const int m = m0 + r;
-                const int k = k0 + c;
-                TA val = from_float<TA>(0.f);
-                if (m < chunk_limit && k < K) {
-                    val = A_base[(int64_t)m * saS + (int64_t)k * saK];
-                }
-                As[r * BK + c] = val; // row-major with stride BK
-            }
+        // Stage A [BM x BK] into shared as row-major (ldA = BK)
+        stage_tile_vec16<TA, BM, BK>(
+            g_tileA0, saS, saK,
+            s_tileA0, BK,
+            rowsA, K_rem,
+            warp_id, warps_per_block
+        );
 
-            // ---- Stage B [thisBK_round x BN] into shared ----
-            // const int b_elems = thisBK_round * BN;
-            // for (int idx = threadIdx.x; idx < b_elems; idx += blockDim.x) {
-            //     const int r = idx / BN;  // [0..thisBK_round)
-            //     const int c = idx % BN;  // [0..BN)
-            //     const int n = n0 + c;
-            //     const int k = k0 + r;
-            //     TB val = from_float<TB>(0.f);
-            //     if (n < chunk_limit && k < K) {
-            //         val = B_base[(int64_t)k * sbK + (int64_t)n * sbS];
-            //     }
-            //     Bs[r * BN + c] = val; // row-major buffer; load as col_major with ld=BN
-            // }
-            const int b_elems = thisBK_round * BN;
-            for (int idx = threadIdx.x; idx < b_elems; idx += blockDim.x) {
-                const int c = idx / thisBK_round;  // column within BN   (n-subtile column)
-                const int r = idx % thisBK_round;  // row within K slab  (kk within K)
-                const int n = n0 + c;
-                const int k = k0 + r;
-                TB val = from_float<TB>(0.f);
-                if (n < chunk_limit && k < K) {
-                    val = B_base[(int64_t)k * sbK + (int64_t)n * sbS];
-                }
-                // col-major store: element (r, c) -> c*ld + r, with ld = thisBK_round
-                Bs[c * thisBK_round + r] = val; // TODO: should load static number of elements with static layout, but pad 0s
-            }
+        // Stage B [BK x BN] into shared as col-major (ldB = BK)
+        stage_tile_vec16<TB, BN, BK>(
+            g_tileB0, sbS, sbK,
+            s_tileB0, BK,
+            colsB, K_rem,
+            warp_id, warps_per_block
+        );
+        __syncthreads();
 
-            __syncthreads();
 
-            // ---- MMA over this slab (step by WMMA_K) ----
-            for (int kk = 0; kk < thisBK_round; kk += WMMA_K) {
-                const TA* a_tile_ptr = &As[(tile_m * 16) * BK + kk];
-                // const TB* b_tile_ptr = &Bs[kk * BN + (tile_n * 16)];
-                const TB* b_tile_ptr = &Bs[(tile_n * 16) * thisBK_round + kk];
+        // in reading order, each warp processes a contiguous set of subtiles (encouraging reuse along N in C, meaning less smem loads of B)
+        // for now, always load, and very simple virtual warp loop
 
+        // compute
+        for (int v_warp = warp_id; v_warp < num_subtiles; v_warp += warps_per_block) {
+            const int tile_m = v_warp / NT;   // 0..MT-1
+            const int tile_n = v_warp % NT;   // 0..NT-1
+
+            // Accumulator fragment for this subtile
+            float* c_smem = Cs + (tile_m * 16) * BN + (tile_n * 16); // row-major with ld = BN
+            wmma::fragment<wmma::accumulator, 16, 16, WMMA_K, float> c_frag;
+            if (k0 == 0) wmma::fill_fragment(c_frag, 0.0f);
+            else wmma::load_matrix_sync(c_frag, c_smem, BN, wmma::mem_row_major);
+
+            // Walk K in slabs of WMMA_K
+            for (int kk = 0; kk < BK; kk += WMMA_K) {
+                // Load A and B fragments from shared memory
                 wmma::fragment<wmma::matrix_a, 16, 16, WMMA_K, ATag, wmma::row_major> a_frag;
                 wmma::fragment<wmma::matrix_b, 16, 16, WMMA_K, BTag, wmma::col_major> b_frag;
-                // wmma::fragment<wmma::matrix_b, 16, 16, WMMA_K, BTag, wmma::row_major> b_frag;
 
-                wmma::load_matrix_sync(a_frag, a_tile_ptr, BK);
-                // wmma::load_matrix_sync(b_frag, b_tile_ptr, BN);
-                wmma::load_matrix_sync(b_frag, b_tile_ptr, thisBK_round);
+                const TA* tileA_ptr = As + (tile_m * 16) * BK + kk; // row-major with ld = BK
+                const TB* tileB_ptr = Bs + (tile_n * 16) * BK + kk; // col-major with ld = BK
 
+                wmma::load_matrix_sync(a_frag, tileA_ptr, BK);
+                wmma::load_matrix_sync(b_frag, tileB_ptr, BK);
+
+                // Perform the matrix multiplication
                 wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
 
-            __syncthreads(); // allow next slab staging
-        }
+            // accumulate in smem C using wmma
+            wmma::store_matrix_sync(c_smem, c_frag, BN, wmma::mem_row_major);
 
-        // ---- Store accumulator to shared (per-warp), then masked write to global ----
-        float* Cw = Cs + warp_id * 16 * 16;
-        wmma::store_matrix_sync(Cw, c_frag, 16, wmma::mem_row_major);
-        __syncwarp();
+        } // end subtile loop
 
-        const int m_base = m0 + tile_m * 16;
-        const int n_base = n0 + tile_n * 16;
+        __syncthreads();
+    }
 
-        for (int t = lane_id; t < 16 * 16; t += 32) {
-            const int dm = t / 16;
-            const int dn = t % 16;
-            const int m = m_base + dm;
-            const int n = n_base + dn;
+    // flush smem C to global as single 2d memcpy
+    // constexpr int VBYTES = 16;
+    constexpr int VBYTES = 4;
+    constexpr int VE = VBYTES / sizeof(TO); // 1 for fp32, 2 for fp16/bf16
+    constexpr int WARP_ELEMS = VE * 32;        // elements per full warp vector copy
+    constexpr int ROW_VECS = DIV_UP(BN, WARP_ELEMS); // how many 16B vectors per row (full warp)
+    const int tile_rows = max(0, min(BM, chunk_limit - m0));
+    const int tile_cols = max(0, min(BN, chunk_limit - n0));
 
-            bool valid = (m < chunk_size) && (n < chunk_size) &&
-                         (m < chunk_limit) && (n < chunk_limit);
-            if (is_causal && n > m) valid = false;
+    for (int v_warp = warp_id; v_warp < BM * ROW_VECS; v_warp += warps_per_block) {
+        const int r      = v_warp / ROW_VECS;                // 0..BM-1 (virtual row)
+        const int c_vec  = v_warp - r * ROW_VECS;            // 0..ROW_VECS-1
+        const int n_off  = c_vec * WARP_ELEMS;                            // element offset along N
 
-            if (valid && seq_base) {
-                const int32_t sm = seq_base[m * ssS];
-                const int32_t sn = seq_base[n * ssS];
-                if (sm != sn) valid = false;
+        float*    s_out = Cs + r * BN + n_off;                    // row-major smem C
+        TO*       g_out = O_base + (int64_t)(m0 + r) * soM + (int64_t)(n0 + n_off) * soN;
+
+        const bool row_ok = (r < tile_rows);
+        const bool n_fits = (n_off + (WARP_ELEMS - 1) < tile_cols);
+        // TODO: check if correct alignment for half/bfloat16
+        const bool can_vec  = (soN == 1) && ((((uintptr_t)s_out & 0x7) == 0) && (((uintptr_t)g_out & 0x3) == 0)); // 4B align (for int32/float)
+        const int  m_abs    = m0 + r;
+        const bool row_in_chunk = (m_abs < chunk_size);
+
+        if (row_ok && row_in_chunk && n_fits && can_vec) {
+            // 128B per warp store, type-aware
+            if constexpr (std::is_same_v<TO, float>) {
+                reinterpret_cast<float*>(g_out)[lane_id] = s_out[lane_id];
+            } else if constexpr (std::is_same_v<TO, __half>) {
+                float2 f2 = reinterpret_cast<float2*>(s_out)[lane_id];
+                half2  h2 = make_half2(__float2half(f2.x), __float2half(f2.y));
+                reinterpret_cast<half2*>(g_out)[lane_id] = h2;
+            } else if constexpr (std::is_same_v<TO, __nv_bfloat16>) {
+                float2 f2 = reinterpret_cast<float2*>(s_out)[lane_id];
+                __nv_bfloat162 b2 = __floats2bfloat162_rn(f2.x, f2.y);
+                reinterpret_cast<__nv_bfloat162*>(g_out)[lane_id] = b2;
+            } else {
+                // Fallback: do scalar path below for unknown TO
+                #pragma unroll
+                for (int i = lane_id; i < WARP_ELEMS; i += 32) {
+                    const int nn = n_off + i;
+                    if (nn >= tile_cols) break;
+                    g_out[i * soN] = from_float<TO>(s_out[i]);
+                }
             }
+        } else {
+            #pragma unroll
+            for (int i = lane_id; i < WARP_ELEMS; i += 32) {
+                const int nn    = n_off + i;
+                const int n_abs = n0 + nn;
+                if (!row_in_chunk || n_abs >= chunk_size) break;
 
-            const float v = valid ? Cw[dm * 16 + dn] : 0.0f;
-            if (m < chunk_size && n < chunk_size) {
-                const int64_t o_idx = (int64_t)m * soM + (int64_t)n * soN;
-                O_base[o_idx] = from_float<TO>(v);
+                float v = 0.0f;
+                if (r < tile_rows && nn < tile_cols) {
+                    v = s_out[i];
+                }
+                g_out[i * soN] = from_float<TO>(v);
             }
         }
     }
@@ -259,11 +336,11 @@ static void launch_bmm_chunk_wmma_typed(
     dim3 block(Param::THREADS);
     dim3 grid(m_tiles * n_tiles, Bsz, n_chunks * ngroups);
 
-    // Shared memory size: As + Bs + per-warp Cs
-    const int warps_per_block = Param::THREADS / 32;
-    size_t shmem = (size_t)Param::BM * Param::BK * sizeof(TA) +
-                   (size_t)Param::BK * Param::BN * sizeof(TB) +
-                   (size_t)warps_per_block * 16 * 16 * sizeof(float);
+    // Shared memory size: As + Bs + Cs
+    size_t shmem = (size_t)Param::BM * Param::BK * sizeof(TA)
+                 + (size_t)Param::BK * Param::BN * sizeof(TB)
+                 + (size_t)Param::BM * Param::BN * sizeof(float);
+
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -341,9 +418,14 @@ mamba2_bmm_chunk_fwd_cuda(const Mamba2SSDArgs& args) {
     // }();
     const auto out_type  = out.scalar_type();
 
-    // Default WMMA config (good general start on SM80+). Keep multiples of 16.
-    using P = bmm_wmma_params</*BM*/128, /*BN*/128, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/2>;
-    // using P = bmm_wmma_params</*BM*/16, /*BN*/16, /*BK*/16, /*THREADS*/32, /*TARGET_BLOCKS*/1>;
+    using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
+    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
+    // // Default WMMA config (good general start on SM80+). Keep multiples of 16.
+    // // using P = bmm_wmma_params</*BM*/128, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
+    // using P = bmm_wmma_params</*BM*/128, /*BN*/128, /*BK*/32, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
+    // // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/64, /*TARGET_BLOCKS*/8>; // close to triton config
+    // // using P = bmm_wmma_params</*BM*/128, /*BN*/128, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
+    // // using P = bmm_wmma_params</*BM*/16, /*BN*/16, /*BK*/16, /*THREADS*/32, /*TARGET_BLOCKS*/1>;
 
 #define LAUNCH(TA, TB, TO) \
     launch_bmm_chunk_wmma_typed<TA, TB, TO, P>( \

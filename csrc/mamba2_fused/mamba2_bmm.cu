@@ -100,7 +100,7 @@ __device__ __forceinline__ void stage_tile_vec16(
 
         // mask
         const bool row_ok_s = (r_base + r_off < ROWS);
-        const bool col_ok_s = ((c_base + c_off) * VE + (VE - 1) < COLS_ROUND);
+        const bool col_ok_s = ((c_base + c_off) * VE + (VE - 1) < COLS_ROUND); // TODO: zero between COLS_ROUND..COLS, might not need if can guarantee COLS multiple of VE
         const bool row_ok_g = (r_base + r_off < rows_active);
         const bool col_ok_g = ((c_base + c_off) * VE + (VE - 1) < K_rem);
         const bool mask_s = row_ok_s && col_ok_s;
@@ -182,9 +182,13 @@ void bmm_chunk_wmma_kernel(
     // Shared memory: A [BM x BK], B [BK x BN], and per-warp C buffer [16x16]
     extern __shared__ __align__(16) unsigned char smem_raw[];
     // TODO: align 16B
+    // NOTE: padding must match launch smem size
+    constexpr int PAD_A_K = 16 / sizeof(TA);
+    constexpr int PAD_B_K = 16 / sizeof(TB);
+    constexpr int PAD_C_N = 8; // TODO: could change if different dtype
     TA* As = reinterpret_cast<TA*>(smem_raw);                           // [BM x BK] row-major
-    TB* Bs = reinterpret_cast<TB*>(As + (size_t)BM * BK);               // [BK x BN] col-major (similar to [BN x BK] row-major)
-    float* Cs = reinterpret_cast<float*>(Bs + (size_t)BK * BN);         // [BM x BN] row-major
+    TB* Bs = reinterpret_cast<TB*>(As + (size_t)BM * (BK + PAD_A_K));               // [BK x BN] col-major (similar to [BN x BK] row-major)
+    float* Cs = reinterpret_cast<float*>(Bs + (size_t)(BK + PAD_B_K) * BN);         // [BM x BN] row-major
 
     const int warp_id = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
@@ -216,7 +220,7 @@ void bmm_chunk_wmma_kernel(
         // Stage A [BM x BK] into shared as row-major (ldA = BK)
         stage_tile_vec16<TA, BM, BK>(
             g_tileA0, saS, saK,
-            s_tileA0, BK,
+            s_tileA0, BK + PAD_A_K,
             rowsA, K_rem,
             warp_id, warps_per_block
         );
@@ -224,7 +228,7 @@ void bmm_chunk_wmma_kernel(
         // Stage B [BK x BN] into shared as col-major (ldB = BK)
         stage_tile_vec16<TB, BN, BK>(
             g_tileB0, sbS, sbK,
-            s_tileB0, BK,
+            s_tileB0, BK + PAD_B_K,
             colsB, K_rem,
             warp_id, warps_per_block
         );
@@ -241,30 +245,30 @@ void bmm_chunk_wmma_kernel(
             const int tile_n = v_warp % NT;   // 0..NT-1
 
             // Accumulator fragment for this subtile
-            float* c_smem = Cs + (tile_m * 16) * BN + (tile_n * 16); // row-major with ld = BN
+            float* c_smem = Cs + (tile_m * 16) * (BN + PAD_C_N) + (tile_n * 16); // row-major with ld = BN
             wmma::fragment<wmma::accumulator, 16, 16, WMMA_K, float> c_frag;
             if (k0 == 0) wmma::fill_fragment(c_frag, 0.0f);
-            else wmma::load_matrix_sync(c_frag, c_smem, BN, wmma::mem_row_major);
+            else wmma::load_matrix_sync(c_frag, c_smem, (BN + PAD_C_N), wmma::mem_row_major);
 
             // Walk K in slabs of WMMA_K
             #pragma unroll
-            for (int kk = 0; kk < BK; kk += WMMA_K) {
+            for (int kk = 0; kk < BK; kk += WMMA_K) { // TODO: consider limit of K_rem
                 // Load A and B fragments from shared memory
                 wmma::fragment<wmma::matrix_a, 16, 16, WMMA_K, ATag, wmma::row_major> a_frag;
                 wmma::fragment<wmma::matrix_b, 16, 16, WMMA_K, BTag, wmma::col_major> b_frag;
 
-                const TA* tileA_ptr = As + (tile_m * 16) * BK + kk; // row-major with ld = BK
-                const TB* tileB_ptr = Bs + (tile_n * 16) * BK + kk; // col-major with ld = BK
+                const TA* tileA_ptr = As + (tile_m * 16) * (BK + PAD_A_K) + kk; // row-major with ld = BK
+                const TB* tileB_ptr = Bs + (tile_n * 16) * (BK + PAD_B_K) + kk; // col-major with ld = BK
 
-                wmma::load_matrix_sync(a_frag, tileA_ptr, BK);
-                wmma::load_matrix_sync(b_frag, tileB_ptr, BK);
+                wmma::load_matrix_sync(a_frag, tileA_ptr, BK + PAD_A_K);
+                wmma::load_matrix_sync(b_frag, tileB_ptr, BK + PAD_B_K);
 
                 // Perform the matrix multiplication
                 wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
 
             // accumulate in smem C using wmma
-            wmma::store_matrix_sync(c_smem, c_frag, BN, wmma::mem_row_major);
+            wmma::store_matrix_sync(c_smem, c_frag, (BN + PAD_C_N), wmma::mem_row_major);
 
         } // end subtile loop
 
@@ -286,7 +290,7 @@ void bmm_chunk_wmma_kernel(
         const int c_vec  = v_warp - r * ROW_VECS;            // 0..ROW_VECS-1
         const int n_off  = c_vec * WARP_ELEMS;                            // element offset along N
 
-        float*    s_out = Cs + r * BN + n_off;                    // row-major smem C
+        float*    s_out = Cs + r * (BN + PAD_C_N) + n_off;                    // row-major smem C
         TO*       g_out = O_base + (int64_t)(m0 + r) * soM + (int64_t)(n0 + n_off) * soN;
 
         const bool row_ok = (r < tile_rows);
@@ -297,26 +301,27 @@ void bmm_chunk_wmma_kernel(
         const bool row_in_chunk = (m_abs < chunk_size);
 
         if (row_ok && row_in_chunk && n_fits && can_vec) {
-            // 128B per warp store, type-aware
-            if constexpr (std::is_same_v<TO, float>) {
-                reinterpret_cast<float*>(g_out)[lane_id] = s_out[lane_id];
-            } else if constexpr (std::is_same_v<TO, __half>) {
-                float2 f2 = reinterpret_cast<float2*>(s_out)[lane_id];
-                half2  h2 = make_half2(__float2half(f2.x), __float2half(f2.y));
-                reinterpret_cast<half2*>(g_out)[lane_id] = h2;
-            } else if constexpr (std::is_same_v<TO, __nv_bfloat16>) {
-                float2 f2 = reinterpret_cast<float2*>(s_out)[lane_id];
-                __nv_bfloat162 b2 = __floats2bfloat162_rn(f2.x, f2.y);
-                reinterpret_cast<__nv_bfloat162*>(g_out)[lane_id] = b2;
-            } else {
-                // Fallback: do scalar path below for unknown TO
-                #pragma unroll
-                for (int i = lane_id; i < WARP_ELEMS; i += 32) {
-                    const int nn = n_off + i;
-                    if (nn >= tile_cols) break;
-                    g_out[i * soN] = from_float<TO>(s_out[i]);
-                }
-            }
+            // TODO: support other dtypes for C global store
+            // // 128B per warp store, type-aware
+            // if constexpr (std::is_same_v<TO, float>) {
+            //     reinterpret_cast<float*>(g_out)[lane_id] = s_out[lane_id];
+            // } else if constexpr (std::is_same_v<TO, __half>) {
+            float2 f2 = reinterpret_cast<float2*>(s_out)[lane_id];
+            half2  h2 = make_half2(__float2half(f2.x), __float2half(f2.y));
+            reinterpret_cast<half2*>(g_out)[lane_id] = h2;
+            // } else if constexpr (std::is_same_v<TO, __nv_bfloat16>) {
+            //     float2 f2 = reinterpret_cast<float2*>(s_out)[lane_id];
+            //     __nv_bfloat162 b2 = __floats2bfloat162_rn(f2.x, f2.y);
+            //     reinterpret_cast<__nv_bfloat162*>(g_out)[lane_id] = b2;
+            // } else {
+            //     // Fallback: do scalar path below for unknown TO
+            //     #pragma unroll
+            //     for (int i = lane_id; i < WARP_ELEMS; i += 32) {
+            //         const int nn = n_off + i;
+            //         if (nn >= tile_cols) break;
+            //         g_out[i * soN] = from_float<TO>(s_out[i]);
+            //     }
+            // }
         } else {
             #pragma unroll
             for (int i = lane_id; i < WARP_ELEMS; i += 32) {
@@ -356,9 +361,13 @@ static void launch_bmm_chunk_wmma_typed(
     dim3 grid(m_tiles * n_tiles, Bsz, n_chunks * ngroups);
 
     // Shared memory size: As + Bs + Cs
-    size_t shmem = (size_t)Param::BM * Param::BK * sizeof(TA)
-                 + (size_t)Param::BK * Param::BN * sizeof(TB)
-                 + (size_t)Param::BM * Param::BN * sizeof(float);
+    // NOTE: padding must match kernel
+    const int PAD_A_K = 16 / sizeof(TA);
+    const int PAD_B_K = 16 / sizeof(TB);
+    const int PAD_C_N = 8; //16 / sizeof(float);
+    size_t shmem = (size_t)Param::BM * (Param::BK + PAD_A_K) * sizeof(TA)
+                 + (size_t)(Param::BK + PAD_B_K) * Param::BN * sizeof(TB)
+                 + (size_t)Param::BM * (Param::BN + PAD_C_N) * sizeof(float);
 
 
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -437,9 +446,13 @@ mamba2_bmm_chunk_fwd_cuda(const Mamba2SSDArgs& args) {
     // }();
     const auto out_type  = out.scalar_type();
 
+    using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/2>;
+
     // using P = bmm_wmma_params</*BM*/32, /*BN*/32, /*BK*/64, /*THREADS*/128, /*TARGET_BLOCKS*/8>;
     // using P = bmm_wmma_params</*BM*/32, /*BN*/32, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
-    using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
+
+    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
+
     // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
     // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
     // // Default WMMA config (good general start on SM80+). Keep multiples of 16.

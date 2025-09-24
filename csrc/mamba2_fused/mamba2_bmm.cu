@@ -57,41 +57,56 @@ __device__ __forceinline__ void stage_tile_vec16(
     int      warp_id,                // 0..(warps_per_block-1)
     int      warps_per_block         // blockDim.x / 32
 ){
-    constexpr int VBYTES = 4;
-    constexpr int VE     = VBYTES / sizeof(T);           // 1 for fp32, 2 for fp16/bf16
-    constexpr int WARP_ELEMS = VE * 32;                  // elements per full warp vector copy
-    constexpr int ROW_VECS   = DIV_UP(COLS, WARP_ELEMS); // how many 16B vectors per row (full warp)
-    constexpr int TOTAL_VECS = ROWS * ROW_VECS; // TODO: don't idle threads if vector is 2x or more than BK
-
     const int lane_id = threadIdx.x & 31;
 
+    constexpr int VBYTES = 16;
+    constexpr int VE     = VBYTES / sizeof(T);           // 1 for fp32, 2 for fp16/bf16, assumed to be power of two
+
+    constexpr int COL_16B = COLS / VE;
+    constexpr int COLS_ROUND = COL_16B * VE; // largest multiple of VE <= COLS (we can't mask within 16B) // TODO: handle remaining elements
+    constexpr bool COL_8 = COL_16B <= 8; // smallest case, use 8 loads per row
+    constexpr bool COL_16 = !COL_8 && COL_16B <= 16; // use 16 loads per row
+    constexpr bool COL_32 = COL_16B >= 32; // use a multiple of 32 loads per row
+    constexpr int ROWS_PER_LOAD = COL_8 ? 4 : (COL_16 ? 2 : 1); // how many rows per load
+    constexpr int LOADS_PER_ROW = COL_32 ? (COL_16B / 32) : 1; // how many loads per row
+    constexpr int TOTAL_LOADS = DIV_UP(ROWS, ROWS_PER_LOAD) * LOADS_PER_ROW; // total loads to cover the tile (may be more than needed)
+    // TODO: check if global ptr is 16B aligned, maybe even need 128B aligned for best perf?
+    // TODO: check if global stride is 1
+    // static_assert((16 % sizeof(T)) == 0, "stage_tile_vec16: T must divide 16B");
+    // assert((((uintptr_t)g_tile0 | (uintptr_t)s_tile0) & 0xF) == 0 && "need 16B alignment");
+
+    // virtual warp loop
     #pragma unroll
-    for (int v = warp_id; v < TOTAL_VECS; v += warps_per_block) {
-        const int r      = v / ROW_VECS;                // 0..ROWS-1 (virtual row)
-        const int c_vec  = v - r * ROW_VECS;            // 0..ROW_VECS-1
-        const int k_off  = c_vec * WARP_ELEMS;          // element offset along K
+    for (int v_warp = warp_id; v_warp < TOTAL_LOADS; v_warp += warps_per_block) {
+        // get row iter based on ROWS_PER_LOAD
+        const int r_iter = v_warp / LOADS_PER_ROW;
+        // get column iter
+        const int c_iter  = v_warp - r_iter * LOADS_PER_ROW;
+        // actual row based on rows_per_load
+        const int r_base = r_iter * ROWS_PER_LOAD;
+        // row load offset
+        const int c_base = c_iter * 32; // 16B offset along K
 
-        T*       s = s_tile0 + r * s_ld + k_off;        // row-major line in smem
-        const T* g = g_tile0 + r * g_stride_row + k_off * g_stride_k;
+        // thread offsets
+        constexpr int THREADS_PER_ROW = 32 / ROWS_PER_LOAD; // threads per column load
+        const int r_off = lane_id / THREADS_PER_ROW; // row offset within the rows_per_load group
+        const int c_off = lane_id - r_off * THREADS_PER_ROW; // lane offset within the column load
 
-        const bool row_ok  = (r < rows_active);
-        const bool k_fits  = (k_off + (WARP_ELEMS - 1) < K_rem);
-        const bool contigK  = (g_stride_k == 1);
-        const bool aligned = (((uintptr_t)g & 0x3) == 0) && (((uintptr_t)s & 0x3) == 0); // 4B align (for int32/float)
+        // ptrs
+        int4*       s4 = reinterpret_cast<int4*>(s_tile0 + (r_base + r_off) * s_ld); // offset by row (col is different size)
+        const int4* g4 = reinterpret_cast<const int4*>(g_tile0 + (r_base + r_off) * g_stride_row); // offset by row (col is different size)
+        s4 += c_base + c_off; // col offsets (in 16B dtype)
+        g4 += c_base + c_off;
 
-        if (row_ok && k_fits && contigK && aligned) {
-            // 4B per lane -> 128B per warp
-            reinterpret_cast<int32_t*>(s)[lane_id] = reinterpret_cast<const int32_t*>(g)[lane_id];
-        } else {
-            // slow path: elementwise for this 16B chunk (handles row tail, K tail, misalign)
-            #pragma unroll
-            for (int i = lane_id; i < WARP_ELEMS; i += 32) {
-                const int kk = k_off + i;
-                if (kk < COLS) {
-                    T val = (row_ok && kk < K_rem) ? g[i * g_stride_k] : from_float<T>(0.0f);
-                    s[i] = val; // contiguous along K in smem
-                }
-            }
+        // mask
+        const bool row_ok_s = (r_base + r_off < ROWS);
+        const bool col_ok_s = ((c_base + c_off) * VE + (VE - 1) < COLS_ROUND);
+        const bool row_ok_g = (r_base + r_off < rows_active);
+        const bool col_ok_g = ((c_base + c_off) * VE + (VE - 1) < K_rem);
+        const bool mask_s = row_ok_s && col_ok_s;
+        const bool mask_g = row_ok_g && col_ok_g;
+        if (mask_s) {
+            s4[0] = mask_g ? g4[0] : make_int4(0,0,0,0);
         }
     }
 }
@@ -220,6 +235,7 @@ void bmm_chunk_wmma_kernel(
         // for now, always load, and very simple virtual warp loop
 
         // compute
+        #pragma unroll
         for (int v_warp = warp_id; v_warp < num_subtiles; v_warp += warps_per_block) {
             const int tile_m = v_warp / NT;   // 0..MT-1
             const int tile_n = v_warp % NT;   // 0..NT-1
@@ -231,6 +247,7 @@ void bmm_chunk_wmma_kernel(
             else wmma::load_matrix_sync(c_frag, c_smem, BN, wmma::mem_row_major);
 
             // Walk K in slabs of WMMA_K
+            #pragma unroll
             for (int kk = 0; kk < BK; kk += WMMA_K) {
                 // Load A and B fragments from shared memory
                 wmma::fragment<wmma::matrix_a, 16, 16, WMMA_K, ATag, wmma::row_major> a_frag;

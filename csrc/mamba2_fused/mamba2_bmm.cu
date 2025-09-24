@@ -65,6 +65,7 @@ __device__ __forceinline__ void stage_tile_vec16(
 
     const int lane_id = threadIdx.x & 31;
 
+    #pragma unroll
     for (int v = warp_id; v < TOTAL_VECS; v += warps_per_block) {
         const int r      = v / ROW_VECS;                // 0..ROWS-1 (virtual row)
         const int c_vec  = v - r * ROW_VECS;            // 0..ROW_VECS-1
@@ -262,6 +263,7 @@ void bmm_chunk_wmma_kernel(
     const int tile_rows = max(0, min(BM, chunk_limit - m0));
     const int tile_cols = max(0, min(BN, chunk_limit - n0));
 
+    #pragma unroll
     for (int v_warp = warp_id; v_warp < BM * ROW_VECS; v_warp += warps_per_block) {
         const int r      = v_warp / ROW_VECS;                // 0..BM-1 (virtual row)
         const int c_vec  = v_warp - r * ROW_VECS;            // 0..ROW_VECS-1
@@ -418,7 +420,10 @@ mamba2_bmm_chunk_fwd_cuda(const Mamba2SSDArgs& args) {
     // }();
     const auto out_type  = out.scalar_type();
 
-    using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
+    // using P = bmm_wmma_params</*BM*/32, /*BN*/32, /*BK*/64, /*THREADS*/128, /*TARGET_BLOCKS*/8>;
+    // using P = bmm_wmma_params</*BM*/32, /*BN*/32, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
+    using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
+    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
     // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
     // // Default WMMA config (good general start on SM80+). Keep multiples of 16.
     // // using P = bmm_wmma_params</*BM*/128, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;

@@ -106,11 +106,68 @@ __device__ __forceinline__ void stage_tile_vec16(
         const bool mask_s = row_ok_s && col_ok_s;
         const bool mask_g = row_ok_g && col_ok_g;
         if (mask_s) {
-            s4[0] = mask_g ? g4[0] : make_int4(0,0,0,0);
+            #if ASYNC_GPU_MEM
+                // use async copy if available (sm80+)
+                uint32_t valid_bytes = mask_g ? VBYTES : 0;
+                uint32_t smem_u32 = static_cast<uint32_t>(__cvta_generic_to_shared(s4));
+                asm volatile(
+                    "cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+                    :
+                    : "r"(smem_u32), "l"(g4), "r"(valid_bytes)
+                );
+            #else
+                s4[0] = mask_g ? g4[0] : make_int4(0,0,0,0);
+            #endif
         }
     }
 }
 
+template <typename TA, typename TB, int BM, int BN, int BK>
+__device__ __forceinline__ void load_AB(
+    const TA* __restrict__ A_base,
+    const TB* __restrict__ B_base,
+    int64_t saS, int64_t saK,
+    int64_t sbS, int64_t sbK,
+    TA* __restrict__ As,
+    TB* __restrict__ Bs,
+    int64_t saS_smem,
+    int64_t sbS_smem,
+    int      chunk_limit,
+    int      K,
+    int      m0,
+    int      n0,
+    int      k0,
+    int      warp_id,
+    int      warps_per_block,
+    bool     swap_high = false // async double buff
+){
+    // for now, load the whole BK up front
+    const int rowsA    = max(0, min(BM, chunk_limit - m0));
+    const int colsB    = max(0, min(BN, chunk_limit - n0));
+    const int K_rem    = max(0, min(BK, K - k0));
+
+    const TA* g_tileA0 = A_base + (int64_t)m0 * saS + (int64_t)k0 * saK;
+    const TB* g_tileB0 = B_base + (int64_t)n0 * sbS + (int64_t)k0 * sbK;
+
+    TA* s_tileA0 = As + (swap_high ? BM * saS_smem : 0); // row-major, ld = BK
+    TB* s_tileB0 = Bs + (swap_high ? BN * sbS_smem : 0); // row-major buffer, ld = BK
+
+    // Stage A [BM x BK] into shared as row-major (ldA = BK)
+    stage_tile_vec16<TA, BM, BK>(
+        g_tileA0, saS, saK,
+        s_tileA0, saS_smem,
+        rowsA, K_rem,
+        warp_id, warps_per_block
+    );
+
+    // Stage B [BK x BN] into shared as col-major (ldB = BK)
+    stage_tile_vec16<TB, BN, BK>(
+        g_tileB0, sbS, sbK,
+        s_tileB0, sbS_smem,
+        colsB, K_rem,
+        warp_id, warps_per_block
+    );
+}
 
 // TODO: make sure it works even with K not multiple of BK or WMMA_K; BK not multiple of WMMA_K
 // ---------------- core kernel (WMMA tensor cores) ----------------
@@ -134,9 +191,6 @@ void bmm_chunk_wmma_kernel(
     // flags
     bool is_causal
 ) {
-#if __CUDA_ARCH__ < 800
-    return; // require SM80+
-#endif
     constexpr int BM = P::BM;
     constexpr int BN = P::BN;
     constexpr int BK = P::BK;
@@ -186,9 +240,14 @@ void bmm_chunk_wmma_kernel(
     constexpr int PAD_A_K = 16 / sizeof(TA);
     constexpr int PAD_B_K = 16 / sizeof(TB);
     constexpr int PAD_C_N = 8; // TODO: could change if different dtype
+    #ifdef DOUBLE_BUFF_BMM
+    constexpr int PIPE_STAGES = 2; // for async copy
+    #else
+    constexpr int PIPE_STAGES = 1;
+    #endif
     TA* As = reinterpret_cast<TA*>(smem_raw);                           // [BM x BK] row-major
-    TB* Bs = reinterpret_cast<TB*>(As + (size_t)BM * (BK + PAD_A_K));               // [BK x BN] col-major (similar to [BN x BK] row-major)
-    float* Cs = reinterpret_cast<float*>(Bs + (size_t)(BK + PAD_B_K) * BN);         // [BM x BN] row-major
+    TB* Bs = reinterpret_cast<TB*>(As + ((size_t)BM * (BK + PAD_A_K)) * PIPE_STAGES);               // [BK x BN] col-major (similar to [BN x BK] row-major)
+    float* Cs = reinterpret_cast<float*>(Bs + ((size_t)(BK + PAD_B_K) * BN) * PIPE_STAGES);         // [BM x BN] row-major
 
     const int warp_id = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
@@ -204,34 +263,93 @@ void bmm_chunk_wmma_kernel(
     static_assert(std::is_same_v<TA, TB>, "TA/TB must match for this WMMA path");
     constexpr int WMMA_K = wmma_prec<TA>::WMMA_K;
 
+
+    // preload
+    #ifdef DOUBLE_BUFF_BMM
+        bool swap_high_p = false; // producer and consumer double buffer halves
+        bool swap_high_c = false;
+        load_AB<TA, TB, BM, BN, BK>(
+            A_base, B_base,
+            saS, saK,
+            sbS, sbK,
+            As,
+            Bs,
+            BK + PAD_A_K,
+            BK + PAD_B_K,
+            chunk_limit,
+            K,
+            m0,
+            n0,
+            0,
+            warp_id,
+            warps_per_block,
+            swap_high_p
+        );
+        swap_high_p = !swap_high_p;
+        // async commit
+        #if ASYNC_GPU_MEM
+            asm volatile("cp.async.commit_group;\n");
+        #endif
+    #endif
+
     // we need to iterate over K in chunks of BK (otherwise not enough shared memory)
     for (int k0 = 0; k0 < K; k0 += BK) {
-        // for now, load the whole BK up front
-        const int rowsA    = max(0, min(BM, chunk_limit - m0));
-        const int colsB    = max(0, min(BN, chunk_limit - n0));
-        const int K_rem    = max(0, min(BK, K - k0));
-
-        const TA* g_tileA0 = A_base + (int64_t)m0 * saS + (int64_t)k0 * saK;
-        const TB* g_tileB0 = B_base + (int64_t)n0 * sbS + (int64_t)k0 * sbK;
-
-        TA* s_tileA0 = As;               // row-major, ld = BK
-        TB* s_tileB0 = Bs;               // row-major buffer, ld = BK
-
-        // Stage A [BM x BK] into shared as row-major (ldA = BK)
-        stage_tile_vec16<TA, BM, BK>(
-            g_tileA0, saS, saK,
-            s_tileA0, BK + PAD_A_K,
-            rowsA, K_rem,
-            warp_id, warps_per_block
-        );
-
-        // Stage B [BK x BN] into shared as col-major (ldB = BK)
-        stage_tile_vec16<TB, BN, BK>(
-            g_tileB0, sbS, sbK,
-            s_tileB0, BK + PAD_B_K,
-            colsB, K_rem,
-            warp_id, warps_per_block
-        );
+        // load A and B tiles from global to shared memory
+        #ifndef DOUBLE_BUFF_BMM // no double buffer
+            load_AB<TA, TB, BM, BN, BK>(
+                A_base, B_base,
+                saS, saK,
+                sbS, sbK,
+                As,
+                Bs,
+                BK + PAD_A_K,
+                BK + PAD_B_K,
+                chunk_limit,
+                K,
+                m0,
+                n0,
+                k0,
+                warp_id,
+                warps_per_block
+            );
+            #if ASYNC_GPU_MEM // await all loads
+                asm volatile("cp.async.commit_group;\n");
+                asm volatile("cp.async.wait_all;\n");
+            #endif
+        #else
+            if (k0 + BK < K) { // if there's a next block to load
+                load_AB<TA, TB, BM, BN, BK>(
+                    A_base, B_base,
+                    saS, saK,
+                    sbS, sbK,
+                    As,
+                    Bs,
+                    BK + PAD_A_K,
+                    BK + PAD_B_K,
+                    chunk_limit,
+                    K,
+                    m0,
+                    n0,
+                    k0 + BK, // load for the next
+                    warp_id,
+                    warps_per_block,
+                    swap_high_p
+                );
+                swap_high_p = !swap_high_p;
+                #if ASYNC_GPU_MEM
+                    // async commit
+                    asm volatile("cp.async.commit_group;\n");
+                    // await previous
+                    asm volatile("cp.async.wait_group 1;\n");
+                #endif
+            } else {
+                #if ASYNC_GPU_MEM // wait all since last
+                    asm volatile("cp.async.wait_all;\n");
+                #endif
+            }
+        #endif
+        
+        // warps consume what others loaded so must sync
         __syncthreads();
 
 
@@ -260,6 +378,13 @@ void bmm_chunk_wmma_kernel(
                 const TA* tileA_ptr = As + (tile_m * 16) * (BK + PAD_A_K) + kk; // row-major with ld = BK
                 const TB* tileB_ptr = Bs + (tile_n * 16) * (BK + PAD_B_K) + kk; // col-major with ld = BK
 
+                #ifdef DOUBLE_BUFF_BMM
+                    if (swap_high_c) { // note: swap_high represents the next tile to preload, so the current preload is the opposite, and the previous preload (to use now) is the same as swap_high
+                        tileA_ptr += BM * (BK + PAD_A_K);
+                        tileB_ptr += BN * (BK + PAD_B_K);
+                    }
+                #endif
+
                 wmma::load_matrix_sync(a_frag, tileA_ptr, BK + PAD_A_K);
                 wmma::load_matrix_sync(b_frag, tileB_ptr, BK + PAD_B_K);
 
@@ -273,6 +398,9 @@ void bmm_chunk_wmma_kernel(
         } // end subtile loop
 
         __syncthreads();
+        #ifdef DOUBLE_BUFF_BMM
+        swap_high_c = !swap_high_c;
+        #endif
     }
 
     // flush smem C to global as single 2d memcpy
@@ -365,8 +493,13 @@ static void launch_bmm_chunk_wmma_typed(
     const int PAD_A_K = 16 / sizeof(TA);
     const int PAD_B_K = 16 / sizeof(TB);
     const int PAD_C_N = 8; //16 / sizeof(float);
-    size_t shmem = (size_t)Param::BM * (Param::BK + PAD_A_K) * sizeof(TA)
-                 + (size_t)(Param::BK + PAD_B_K) * Param::BN * sizeof(TB)
+    #ifdef DOUBLE_BUFF_BMM
+    constexpr int PIPE_STAGES = 2; // for async copy
+    #else
+    constexpr int PIPE_STAGES = 1;
+    #endif
+    size_t shmem = ((size_t)Param::BM * (Param::BK + PAD_A_K) * sizeof(TA)) * PIPE_STAGES
+                 + ((size_t)(Param::BK + PAD_B_K) * Param::BN * sizeof(TB)) * PIPE_STAGES
                  + (size_t)Param::BM * (Param::BN + PAD_C_N) * sizeof(float);
 
 
@@ -445,22 +578,10 @@ mamba2_bmm_chunk_fwd_cuda(const Mamba2SSDArgs& args) {
     //     return at::kFloat;
     // }();
     const auto out_type  = out.scalar_type();
-
     using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/2>;
-
-    // using P = bmm_wmma_params</*BM*/32, /*BN*/32, /*BK*/64, /*THREADS*/128, /*TARGET_BLOCKS*/8>;
-    // using P = bmm_wmma_params</*BM*/32, /*BN*/32, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
-
-    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/512, /*TARGET_BLOCKS*/4>;
-
-    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
-    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
-    // // Default WMMA config (good general start on SM80+). Keep multiples of 16.
-    // // using P = bmm_wmma_params</*BM*/128, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
-    // using P = bmm_wmma_params</*BM*/128, /*BN*/128, /*BK*/32, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
-    // // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/64, /*TARGET_BLOCKS*/8>; // close to triton config
-    // // using P = bmm_wmma_params</*BM*/128, /*BN*/128, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
-    // // using P = bmm_wmma_params</*BM*/16, /*BN*/16, /*BK*/16, /*THREADS*/32, /*TARGET_BLOCKS*/1>;
+    // for double buffered
+    // using P = bmm_wmma_params</*BM*/64, /*BN*/64, /*BK*/32, /*THREADS*/512, /*TARGET_BLOCKS*/2>;
+    // using P = bmm_wmma_params</*BM*/32, /*BN*/64, /*BK*/64, /*THREADS*/256, /*TARGET_BLOCKS*/4>;
 
 #define LAUNCH(TA, TB, TO) \
     launch_bmm_chunk_wmma_typed<TA, TB, TO, P>( \

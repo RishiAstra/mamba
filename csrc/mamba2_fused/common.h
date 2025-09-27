@@ -4,6 +4,8 @@
 #include <c10/util/Optional.h>
 
 #define DIV_UP(a, b) (((a) + (b) - 1) / (b))
+#define ASYNC_GPU_MEM (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+// #define DOUBLE_BUFF_BMM // actually reduces performance due to higher shared memory usage causing smaller blocks
 
 struct Mamba2SSDArgs {
     // Required tensors (match get_rand_input)

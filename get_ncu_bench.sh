@@ -1,0 +1,2 @@
+ncu -s 10 -c 4 -k _chunk_cumsum_fwd_kernel --clock-control none --cache-control none --import-source yes --set full -o "nsight/mamba_%i_orig.ncu-rep" /home/raa32/miniconda3/envs/mamba_cuda/bin/python ssm_benchmark.py
+# ncu -s 10 -c 4 -k _bmm_chunk_fwd_kernel --clock-control none --cache-control none --import-source yes --set full -o "nsight/mamba_%i_orig.ncu-rep" /home/raa32/miniconda3/envs/mamba_cuda/bin/python ssm_benchmark.py

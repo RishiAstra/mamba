@@ -41,8 +41,8 @@ std::tuple<c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<a
     };
 
     // for now, we just run cumsum
-    // return mamba2_cumsum_fwd_cuda(args);
-    return mamba2_bmm_chunk_fwd_cuda(args);
+    return mamba2_cumsum_fwd_cuda(args);
+    // return mamba2_bmm_chunk_fwd_cuda(args);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

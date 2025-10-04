@@ -59,13 +59,13 @@ def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, 
     # for quick testing
     # return x.clone()
 
-    # # cumsum test
-    # dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias, dt_softplus)
-    # return None, None, dt_out, dA_cumsum, None, None
+    # cumsum test
+    dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias, dt_softplus)
+    return None, None, dt_out, dA_cumsum, None, None
 
-    # bmm test
-    out = _bmm_chunk_fwd(C, B, chunk_size, seq_idx, False)
-    return out, None, None, None, None, None
+    # # bmm test
+    # out = _bmm_chunk_fwd(C, B, chunk_size, seq_idx, False)
+    # return out, None, None, None, None, None
 
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
@@ -114,8 +114,8 @@ def get_test_size(seqlen):
     return (batch, seqlen, nheads, headdim, ngroups, dstate)
 
 test_sizes = [
-    (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1) #9 for batch=1, 6 for 8, 4 for 32 so that original doesn't fail
-    # (get_test_size(1024 * 2 ** i),) for i in [7] # for quick test
+    # (get_test_size(1024 * 2 ** i),) for i in range(0, 9, 1) #9 for batch=1, 6 for 8, 4 for 32 so that original doesn't fail
+    (get_test_size(1024 * 2 ** i),) for i in [7] # for quick test
     # (get_test_size(2753))
 ]
 
@@ -271,6 +271,15 @@ def benchmark(dims_b_seq_nh_hd_ng_ds, provider):
     )
     perf = lambda ms: batch * seqlen / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
+
+    # ms = triton.testing.do_bench( \
+    #     lambda: things_to_compare[provider][0](
+    #         x, dt, A, B, C, CHUNK_SIZE_ORIGINAL if provider == 0 else CHUNK_SIZE_FUSED, D=D, z=None, dt_bias=dt_bias,
+    #         initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=have_dt_softplus), \
+    #     rep=BENCHMARK_REPEATS
+    # )
+    # perf = lambda ms: batch * seqlen / (ms * 1e-3)
+    # return perf(ms)
 
 if __name__ == "__main__":
     # use to check correctness

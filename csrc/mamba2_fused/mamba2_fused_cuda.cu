@@ -107,12 +107,24 @@ void mamba2_ssd_step1_dt_transform_cumsum_kernel(
     }
 
 
-    #pragma unroll
-    for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) {
-        const int h = h_base + rep;
-        A_h[rep] = (h < H) ? A[h] : 0.f;
-        bias_h[rep] = (h < H && dt_bias != nullptr) ? __half2float(dt_bias[h]) : 0.f;
-    }
+    // #pragma unroll
+    // for (int rep = 0; rep < Params::CUMSUM_H_BLOCK; rep++) {
+    //     const int h = h_base + rep;
+    //     A_h[rep] = (h < H) ? A[h] : 0.f;
+    //     bias_h[rep] = (h < H && dt_bias != nullptr) ? __half2float(dt_bias[h]) : 0.f;
+    // }
+    // TODO: don't assume CUMSUM_H_BLOCK divides 4
+    float4 A_h4 = *reinterpret_cast<const float4*>(A + h_base);
+    // half4 bias_h4 = (dt_bias != nullptr) ? *reinterpret_cast<const half4*>(dt_bias + h_base) : make_half4(0.f, 0.f, 0.f, 0.f);
+    ushort4 bias_h4 = (dt_bias != nullptr) ? *reinterpret_cast<const ushort4*>(dt_bias + h_base) : make_ushort4(0, 0, 0, 0);
+    A_h[0] = A_h4.x;
+    A_h[1] = A_h4.y;
+    A_h[2] = A_h4.z;
+    A_h[3] = A_h4.w;
+    bias_h[0] = __half2float(__ushort_as_half(bias_h4.x));
+    bias_h[1] = __half2float(__ushort_as_half(bias_h4.y));
+    bias_h[2] = __half2float(__ushort_as_half(bias_h4.z));
+    bias_h[3] = __half2float(__ushort_as_half(bias_h4.w));
 
     // TODO: support chunk size != block size
     #pragma unroll

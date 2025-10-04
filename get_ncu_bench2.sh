@@ -1,0 +1,2 @@
+ncu -s 10 -c 4 -k mamba2_ssd_step1_dt_transform_cumsum_kernel --clock-control none --cache-control none --import-source yes --set full -o "nsight/mamba_%i.ncu-rep" /home/raa32/miniconda3/envs/mamba_cuda/bin/python ssm_benchmark.py
+# ncu -s 10 -c 4 -k bmm_chunk_wmma_kernel --clock-control none --cache-control none --import-source yes --set full -o "nsight/mamba_%i.ncu-rep" /home/raa32/miniconda3/envs/mamba_cuda/bin/python ssm_benchmark.py

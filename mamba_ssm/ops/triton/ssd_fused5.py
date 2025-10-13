@@ -642,37 +642,10 @@ def _fused5_ssd_kernel(
             offs_hd[None, :] * prev_state_stride_hdim
             + offs_k_dstate[:, None] * prev_state_stride_dstate
         )
-        scale_m = tl.exp(dA_cs_m)
 
-        if seq_idx_prev != seq_idx_m:
-            scale_m *= 0.0  # if new sequence, don't let previous chunk affect
-
-        if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
-            if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
-                C = tl.load(
-                    C_ptrs,
-                    mask=(offs_cs[:, None] < chunk_size_limit),
-                    other=0.0,
-                )
-                prev_states = tl.load(prev_states_ptrs)
-            else:
-                C = tl.load(
-                    C_ptrs,
-                    mask=(offs_cs[:, None] < chunk_size_limit)
-                    & (offs_k_dstate[None, :] < dstate),
-                    other=0.0,
-                )
-                prev_states = tl.load(
-                    prev_states_ptrs,
-                    mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim),
-                    other=0.0,
-                )
-            prev_states = prev_states.to(C_ptr.dtype.element_ty)
-            acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(
-                acc.dtype
-            )
-        else:
-            for k in range(0, dstate, CS_BLOCK_SIZE_DS):
+        if seq_idx_prev == seq_idx_m: # if new sequence, add previous chunk affect
+            scale_m = tl.exp(dA_cs_m)
+            if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
                 if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
                     C = tl.load(
                         C_ptrs,
@@ -684,20 +657,45 @@ def _fused5_ssd_kernel(
                     C = tl.load(
                         C_ptrs,
                         mask=(offs_cs[:, None] < chunk_size_limit)
-                        & (offs_k_dstate[None, :] < dstate - k),
+                        & (offs_k_dstate[None, :] < dstate),
                         other=0.0,
                     )
                     prev_states = tl.load(
                         prev_states_ptrs,
-                        mask=(offs_k_dstate[:, None] < dstate - k)
-                        & (offs_hd[None, :] < hdim),
+                        mask=(offs_k_dstate[:, None] < dstate) & (offs_hd[None, :] < hdim),
                         other=0.0,
                     )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
-                acc += tl.dot(C, prev_states, out_dtype=acc.dtype)
-                C_ptrs += CS_BLOCK_SIZE_DS
-                prev_states_ptrs += CS_BLOCK_SIZE_DS
-            acc *= (scale_m[:, None]).to(acc.dtype)
+                acc = tl.dot(C, prev_states, out_dtype=acc.dtype) * (scale_m[:, None]).to(
+                    acc.dtype
+                )
+            else:
+                for k in range(0, dstate, CS_BLOCK_SIZE_DS):
+                    if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
+                        C = tl.load(
+                            C_ptrs,
+                            mask=(offs_cs[:, None] < chunk_size_limit),
+                            other=0.0,
+                        )
+                        prev_states = tl.load(prev_states_ptrs)
+                    else:
+                        C = tl.load(
+                            C_ptrs,
+                            mask=(offs_cs[:, None] < chunk_size_limit)
+                            & (offs_k_dstate[None, :] < dstate - k),
+                            other=0.0,
+                        )
+                        prev_states = tl.load(
+                            prev_states_ptrs,
+                            mask=(offs_k_dstate[:, None] < dstate - k)
+                            & (offs_hd[None, :] < hdim),
+                            other=0.0,
+                        )
+                    prev_states = prev_states.to(C_ptr.dtype.element_ty)
+                    acc += tl.dot(C, prev_states, out_dtype=acc.dtype)
+                    C_ptrs += CS_BLOCK_SIZE_DS
+                    prev_states_ptrs += CS_BLOCK_SIZE_DS
+                acc *= (scale_m[:, None]).to(acc.dtype)
 
         offs_k = tl.arange(0, CS_BLOCK_SIZE_CS_inner)
         cb_ptrs = cb_ptr + (

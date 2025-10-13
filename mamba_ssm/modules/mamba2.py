@@ -28,8 +28,8 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined_varlen as mamba_chunk_scan_combined
+# from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 from huggingface_hub import PyTorchModelHubMixin
 
@@ -184,100 +184,100 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        if self.use_mem_eff_path and inference_params is None:
-            out = mamba_split_conv1d_scan_combined(
-                zxbcdt,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.dt_bias,
-                A,
-                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                chunk_size=self.chunk_size,
-                seq_idx=seq_idx,
-                activation=self.activation,
-                rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
-                rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
-                outproj_weight=self.out_proj.weight,
-                outproj_bias=self.out_proj.bias,
-                headdim=None if self.D_has_hdim else self.headdim,
-                ngroups=self.ngroups,
-                norm_before_gate=self.norm_before_gate,
-                **dt_limit_kwargs,
-                mamba2_fusion_type=mamba2_fusion_type,
-            )
-            if seqlen_og is not None:
-                out = rearrange(out, "b l d -> (b l) d")
-            if self.process_group is not None:
-                reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
-                out = reduce_fn(out, self.process_group)
-        else:
-            d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
-            z0, x0, z, xBC, dt = torch.split(
-                zxbcdt,
-                [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
-                dim=-1
-            )
-            if conv_state is not None:
-                if cu_seqlens is None:
-                    # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                    # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                    xBC_t = rearrange(xBC, "b l d -> b d l")
-                    conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
-                else:
-                    assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
-                    assert batch == 1, "varlen inference only supports batch dimension 1"
-                    conv_varlen_states = causal_conv1d_varlen_states(
-                        xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
-                    )
-                    conv_state.copy_(conv_varlen_states)
-            assert self.activation in ["silu", "swish"]
-            if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
-                assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
-                xBC = self.act(
-                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
-                )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+        # if self.use_mem_eff_path and inference_params is None:
+        #     out = mamba_split_conv1d_scan_combined(
+        #         zxbcdt,
+        #         rearrange(self.conv1d.weight, "d 1 w -> d w"),
+        #         self.conv1d.bias,
+        #         self.dt_bias,
+        #         A,
+        #         D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+        #         chunk_size=self.chunk_size,
+        #         seq_idx=seq_idx,
+        #         activation=self.activation,
+        #         rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+        #         rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+        #         outproj_weight=self.out_proj.weight,
+        #         outproj_bias=self.out_proj.bias,
+        #         headdim=None if self.D_has_hdim else self.headdim,
+        #         ngroups=self.ngroups,
+        #         norm_before_gate=self.norm_before_gate,
+        #         **dt_limit_kwargs,
+        #         mamba2_fusion_type=mamba2_fusion_type,
+        #     )
+        #     if seqlen_og is not None:
+        #         out = rearrange(out, "b l d -> (b l) d")
+        #     if self.process_group is not None:
+        #         reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+        #         out = reduce_fn(out, self.process_group)
+        # else:
+        d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+        z0, x0, z, xBC, dt = torch.split(
+            zxbcdt,
+            [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+            dim=-1
+        )
+        if conv_state is not None:
+            if cu_seqlens is None:
+                # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                xBC_t = rearrange(xBC, "b l d -> b d l")
+                conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
             else:
-                xBC = causal_conv1d_fn(
-                    xBC.transpose(1, 2),
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=seq_idx,
-                ).transpose(1, 2)
-            x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-            y = mamba_chunk_scan_combined(
-                rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-                dt,
-                A,
-                rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-                rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-                chunk_size=self.chunk_size,
-                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
-                dt_bias=self.dt_bias,
-                dt_softplus=True,
+                assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
+                assert batch == 1, "varlen inference only supports batch dimension 1"
+                conv_varlen_states = causal_conv1d_varlen_states(
+                    xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+                )
+                conv_state.copy_(conv_varlen_states)
+        assert self.activation in ["silu", "swish"]
+        if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+            assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
+            xBC = self.act(
+                self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
+            )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+        else:
+            xBC = causal_conv1d_fn(
+                xBC.transpose(1, 2),
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                bias=self.conv1d.bias,
+                activation=self.activation,
                 seq_idx=seq_idx,
-                cu_seqlens=cu_seqlens,
-                **dt_limit_kwargs,
-                return_final_states=ssm_state is not None,
-                return_varlen_states=cu_seqlens is not None and inference_params is not None,
-                mamba2_fusion_type=mamba2_fusion_type,
-            )
-            if ssm_state is not None:
-                y, last_state, *rest = y
-                if cu_seqlens is None:
-                    ssm_state.copy_(last_state)
-                else:
-                    varlen_states = rest[0]
-                    ssm_state.copy_(varlen_states)
-            y = rearrange(y, "b l h p -> b l (h p)")
-            if self.rmsnorm:
-                y = self.norm(y, z)
-            if d_mlp > 0:
-                y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-            if seqlen_og is not None:
-                y = rearrange(y, "b l d -> (b l) d")
-            out = self.out_proj(y)
+            ).transpose(1, 2)
+        x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+        y = mamba_chunk_scan_combined(
+            rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+            dt,
+            A,
+            rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+            rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+            chunk_size=self.chunk_size,
+            D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+            z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+            dt_bias=self.dt_bias,
+            dt_softplus=True,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            **dt_limit_kwargs,
+            return_final_states=ssm_state is not None,
+            return_varlen_states=cu_seqlens is not None and inference_params is not None,
+            mamba2_fusion_type=mamba2_fusion_type,
+        )
+        if ssm_state is not None:
+            y, last_state, *rest = y
+            if cu_seqlens is None:
+                ssm_state.copy_(last_state)
+            else:
+                varlen_states = rest[0]
+                ssm_state.copy_(varlen_states)
+        y = rearrange(y, "b l h p -> b l (h p)")
+        if self.rmsnorm:
+            y = self.norm(y, z)
+        if d_mlp > 0:
+            y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+        if seqlen_og is not None:
+            y = rearrange(y, "b l d -> (b l) d")
+        out = self.out_proj(y)
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):

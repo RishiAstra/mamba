@@ -63,22 +63,17 @@ from .softplus import softplus
 )
 @triton.heuristics(
     values={
-        # "NEED_MASK_HD": lambda args: args["hdim"] / args["BLOCK_SIZE_HD"]
-        # != args["hdim"] // args["BLOCK_SIZE_HD"],
-        # "NEED_MASK_CS_DS": lambda args: args["dstate"] / args["CS_BLOCK_SIZE_DS"]
-        # != args["dstate"] // args["CS_BLOCK_SIZE_DS"]
-        # or args["dstate"] != args["BLOCK_SIZE_DSTATE"],
-        # "NEED_MASK_CS_CS_inner": lambda args: args["chunk_size"] / args["CS_BLOCK_SIZE_CS_inner"]
-        # != args["chunk_size"] // args["CS_BLOCK_SIZE_CS_inner"],
-        # "NEED_MASK_CS_CS_outer": lambda args: args["chunk_size"] / args["CS_BLOCK_SIZE_CS_outer"]
-        # != args["chunk_size"] // args["CS_BLOCK_SIZE_CS_outer"],
-        # "NEED_MASK_1_DS": lambda args: args["dstate"] / args["BLOCK_SIZE_DS"]
-        # != args["dstate"] // args["BLOCK_SIZE_DS"],
-        "NEED_MASK_HD": lambda args: True,
-        "NEED_MASK_CS_DS": lambda args: True,
-        "NEED_MASK_CS_CS_inner": lambda args: True,
-        "NEED_MASK_CS_CS_outer": lambda args: True,
-        "NEED_MASK_1_DS": lambda args: True,
+        "NEED_MASK_HD": lambda args: args["hdim"] / args["BLOCK_SIZE_HD"]
+        != args["hdim"] // args["BLOCK_SIZE_HD"],
+        "NEED_MASK_CS_DS": lambda args: args["dstate"] / args["CS_BLOCK_SIZE_DS"]
+        != args["dstate"] // args["CS_BLOCK_SIZE_DS"]
+        or args["dstate"] != args["BLOCK_SIZE_DSTATE"],
+        "NEED_MASK_CS_CS_inner": lambda args: args["chunk_size"] / args["CS_BLOCK_SIZE_CS_inner"]
+        != args["chunk_size"] // args["CS_BLOCK_SIZE_CS_inner"],
+        "NEED_MASK_CS_CS_outer": lambda args: args["chunk_size"] / args["CS_BLOCK_SIZE_CS_outer"]
+        != args["chunk_size"] // args["CS_BLOCK_SIZE_CS_outer"],
+        "NEED_MASK_1_DS": lambda args: args["dstate"] / args["BLOCK_SIZE_DS"]
+        != args["dstate"] // args["BLOCK_SIZE_DS"],
     }
 )
 @triton.jit
@@ -450,7 +445,7 @@ def _fused5_ssd_kernel(
             offs_ds[None, :] * stride_b_dstate + offs_cs[:, None] * stride_b_seqlen
         )
         dt_ptrs_cs = dt_ptr + offs_cs * stride_dt_csize
-        dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size_limit - 1) * stride_dA_cs_csize).to( # TODO: temp fix
+        dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(
             tl.float32
         )
         dA_cumsum_ptrs_cs = dA_cumsum_ptr + offs_cs * stride_dA_cs_csize
@@ -462,7 +457,7 @@ def _fused5_ssd_kernel(
             else states_G_ptr.dtype.element_ty
         )
         acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=acc_dtype)
-        for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
+        for k in range(0, chunk_size_limit, BLOCK_SIZE_CS): # TODO: consider chunk_size with if instead of chunk_size_limit
             if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
                 x = tl.load(
                     x_ptrs_cs,
@@ -525,7 +520,7 @@ def _fused5_ssd_kernel(
         )
 
         # offset gets us to the end of each chunk
-        dA_cs = tl.load(dA_cumsum_ptr + (chunk_size_limit - 1) * stride_dA_cs_csize).to( # TODO: temp fix
+        dA_cs = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(
             tl.float32
         )
         scale = tl.exp(dA_cs)
@@ -615,7 +610,7 @@ def _fused5_ssd_kernel(
         else:
             dA_cs_m = tl.load(
                 dA_cumsum_ptr + offs_cs * stride_dA_cs_csize,
-                mask=offs_cs < chunk_size_limit, # TODO: temp fix
+                mask=offs_cs < chunk_size,
                 other=0.0,
             ).to(tl.float32)
 
@@ -720,15 +715,15 @@ def _fused5_ssd_kernel(
             else:
                 cb = tl.load(
                     cb_ptrs,
-                    mask=(offs_cs[:, None] < chunk_size_limit)
-                    & (offs_k[None, :] < chunk_size_limit - k),
+                    mask=(offs_cs[:, None] < chunk_size)
+                    & (offs_k[None, :] < chunk_size - k),
                     other=0.0,
                     eviction_policy="evict_last",
                 )
                 dA_cs_k = tl.load(
-                    dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0
+                    dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0
                 ).to(tl.float32)
-                dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0).to(
+                dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(
                     tl.float32 if CB_SCALE_FP32 else acc.dtype
                 )
             # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
@@ -858,13 +853,9 @@ def _fused5_ssd(
     :param dt_limit: clamp for dt
     """
     # precision settings
-    # cb_store_fp32 = False
-    # cb_scale_fp32 = False
-    # cs_acc_fp32 = False
-    # cb_comp_fp32 = True
-    cb_store_fp32 = True
-    cb_scale_fp32 = True
-    cs_acc_fp32 = True
+    cb_store_fp32 = False
+    cb_scale_fp32 = False
+    cs_acc_fp32 = False
     cb_comp_fp32 = True
 
     seqlen, nheads, hdim = x.shape

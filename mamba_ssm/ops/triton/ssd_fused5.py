@@ -594,8 +594,8 @@ def _fused5_ssd_kernel(
     prev_state_stride_dstate = stride_states_G_dstate
 
     seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=0)
+    seq_idx_m = tl.load(seq_idx_ptr)  # current seq idx
     if HAS_INITSTATES:  # if new sequence, switch to initial states
-        seq_idx_m = tl.load(seq_idx_ptr)  # current seq idx
         if seq_idx_prev != seq_idx_m:
             # - replace prev_states_ptr with init_states
             prev_state_base_ptr = (
@@ -643,6 +643,9 @@ def _fused5_ssd_kernel(
             + offs_k_dstate[:, None] * prev_state_stride_dstate
         )
         scale_m = tl.exp(dA_cs_m)
+
+        if seq_idx_prev != seq_idx_m:
+            scale_m *= 0.0  # if new sequence, don't let previous chunk affect
 
         if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
             if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
@@ -1062,4 +1065,6 @@ def _fused5_ssd(
     final_states = states_G[nchunks].to(
         states_G.dtype, copy=True
     )  # copy and convert to expected dtype
-    return out_x, states_G[:nchunks], final_states, dA_cumsum, dt_out, CB # TODO: CB is temporary
+    # return out_x, states_G[:nchunks], final_states, dA_cumsum, dt_out, CB # TODO: CB is temporary
+    # TODO: tiny but major bug needs to be fixed in other branches, states excludes the wrong end
+    return out_x, states_G[1:], final_states, dA_cumsum, dt_out, CB # TODO: CB is temporary

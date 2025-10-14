@@ -83,7 +83,7 @@ def _mamba_chunk_scan_combined_fwd(
 
     if fused:  # all 5 kernels fused
         # return out_x, states_G[:nchunks], final_states, dA_cumsum, dt_out, CB # TODO: CB is temporary
-        _, states, _, dA_cumsum, dt, CB = _fused5_ssd(
+        _, states, dA_cumsum, dt, CB = _fused5_ssd(
             x,
             dt,
             A,

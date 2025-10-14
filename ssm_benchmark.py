@@ -120,7 +120,7 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, fused=False):
     cu_seqlens_cpu = [0] # holds bounds for sequences (inclusive, exclusive)
     cu_chunk_seqlens_cpu = [0] # holds token# of chunk boundaries
     # make random sequence lengths
-    max_part_seqlen = seqlen // 4 # each sequence at most 1/4 of total length for a basic test
+    max_part_seqlen = seqlen // 4#32 # each sequence at most 1/4 of total length for a basic test
     split = random.randint(1, max_part_seqlen)
     while True: #split < seqlen:
         # mark split
@@ -162,12 +162,26 @@ def run_unit_test(seqlen):
             initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, cu_chunk_seqlens=cu_chunk_seqlens, dt_softplus=have_dt_softplus
         ))
 
+    _, _, _, _, _, _, _, _, _, _, cu_chunk_seqlens = get_rand_input(get_test_size(seqlen), fused=(i == 1))
+
     field_names = ["out", "out_x", "dt", "dA_cumsum", "CB", "states", "final_states"]
     for field_idx in range(len(outputs_full[0])):
         outputs_0 = outputs_full[0][field_idx]
         if outputs_0 is None: # skip None
             continue
         print(f"comparing field {field_names[field_idx]}")
+
+        # CB could have partial chunks, need to zero out for comparison
+        if field_names[field_idx] == "CB":
+            for output in outputs_full:
+                for i in range(len(cu_chunk_seqlens)-1):
+                    chunk_len = cu_chunk_seqlens[i+1] - cu_chunk_seqlens[i]
+                    if output[field_idx] is not None:
+                        output[field_idx][i, :, chunk_len:, :] = 0
+        # CB causal, zero out triangle
+        if field_names[field_idx] == "CB":
+            for output in outputs_full:
+                output[field_idx].copy_(torch.tril(output[field_idx]))
 
         SAVE_BAD_TENSOR = False
         bad_tensor_idx_i = -1
@@ -200,7 +214,7 @@ def run_unit_test(seqlen):
 
 
         if bad_tensor_idx_i >= 0 and SAVE_BAD_TENSOR:
-            np.savetxt(f'bad_output_{field_idx}.txt', outputs_full[bad_tensor_idx_i][field_idx].cpu().numpy(), fmt="%.2e")
+            np.savetxt(f'bad_output_{field_idx}.txt', outputs_full[bad_tensor_idx_i][field_idx].reshape(-1, outputs_full[bad_tensor_idx_i][field_idx].shape[-1]).cpu().numpy(), fmt="%.2e")
 
 # triton benchmark function
 @triton.testing.perf_report(configs)

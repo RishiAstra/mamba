@@ -397,7 +397,7 @@ def _fused5_ssd_kernel(
 
     # advance ptrs up front to simplify and slightly reduce register pressure
     # does actually provide a small benefit vs the original separate ptrs per step
-    states_G_ptr += pid_h * stride_states_G_head + pid_c * stride_states_G_chunk
+    states_G_ptr += pid_h * stride_states_G_head + (pid_c - 1) * stride_states_G_chunk # -1 because this will be the target write location instead of read
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     b_ptr += (
         chunk_seqlen_start * stride_b_seqlen
@@ -553,11 +553,13 @@ def _fused5_ssd_kernel(
                     + offs_hd[:, None] * stride_initial_states_hdim
                     + offs_ds[None, :] * stride_initial_states_dstate
                 )
-
-        if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
-            states_prev = tl.load(states_prev_ptrs)
+        if seq_idx_new != seq_idx_prev and not HAS_INITSTATES:
+            states_prev = tl.zeros(states.shape, dtype=states_prev_ptrs.dtype.element_ty)
         else:
-            states_prev = tl.load(states_prev_ptrs, mask=main_mask, other=0.0)
+            if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
+                states_prev = tl.load(states_prev_ptrs)
+            else:
+                states_prev = tl.load(states_prev_ptrs, mask=main_mask, other=0.0)
 
         states_mod = (
             scale * states_prev + states
@@ -588,7 +590,7 @@ def _fused5_ssd_kernel(
     prev_state_stride_hdim = stride_states_G_hdim
     prev_state_stride_dstate = stride_states_G_dstate
 
-    seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=0)
+    seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
     seq_idx_m = tl.load(seq_idx_ptr)  # current seq idx
     if HAS_INITSTATES:  # if new sequence, switch to initial states
         if seq_idx_prev != seq_idx_m:
@@ -853,8 +855,8 @@ def _fused5_ssd(
     :param dt_limit: clamp for dt
     """
     # precision settings
-    cb_store_fp32 = False
-    cb_scale_fp32 = False
+    cb_store_fp32 = True
+    cb_scale_fp32 = True
     cs_acc_fp32 = False
     cb_comp_fp32 = True
 
@@ -892,9 +894,8 @@ def _fused5_ssd(
     assert dA_chunk_cumsum.shape == (nheads, nchunks)
     assert seq_idx is not None and seq_idx.shape == (nchunks,)
 
-    # +1 for the final states
     states_G = torch.empty(
-        (nchunks + 1, nheads, hdim, dstate), device=x.device, dtype=state_dtype
+        (nchunks, nheads, hdim, dstate), device=x.device, dtype=state_dtype
     )
     # setup from chunk scan
     assert C.shape == (seqlen, ngroups, dstate)
@@ -908,14 +909,6 @@ def _fused5_ssd(
     if initial_states is not None:
         num_varlen_seqs = initial_states.shape[0]
         assert initial_states.shape == (num_varlen_seqs, nheads, hdim, dstate)
-        # with initial states, we need to take care of how
-        # seq_idx crosses the boundaries
-
-        # TODO: try copying all init states here if it's cheaper
-        states_G[0, :, :, :] = initial_states[0, :, :, :]  # initialize to zero
-
-    else:
-        states_G[0, :, :, :] = 0  # initialize to zero
 
     initial_states_strides = (
         (
@@ -1049,11 +1042,6 @@ def _fused5_ssd(
         CB_COMP_FP32=cb_comp_fp32,
     )
 
-    # states_G holds both states and final states
-    # TODO: can skip this copy if copied outside of function
-    final_states = states_G[nchunks].to(
-        states_G.dtype, copy=True
-    )  # copy and convert to expected dtype
     # return out_x, states_G[:nchunks], final_states, dA_cumsum, dt_out, CB # TODO: CB is temporary
     # TODO: tiny but major bug needs to be fixed in other branches, states excludes the wrong end
-    return out_x, states_G[1:], final_states, dA_cumsum, dt_out, CB # TODO: CB is temporary
+    return out_x, states_G, dA_cumsum, dt_out, CB # TODO: CB is temporary

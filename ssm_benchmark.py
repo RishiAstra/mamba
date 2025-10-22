@@ -7,6 +7,15 @@
 # check correctness or benchmark
 CHECK_CORRECTNESS = True
 
+# more settings for test tensors, probably best to leave as is
+have_init_states    = True
+have_dt_softplus    = True # TODO: test more
+
+# the chunk sizes to use for original and fused kernels
+# note that the original kernel and fused kernel have different optimal chunk sizes
+CHUNK_SIZE_ORIGINAL=128#256
+CHUNK_SIZE_FUSED=128
+
 # dimensions to test
 # seqlen    = set per test
 nheads      = 80
@@ -29,14 +38,6 @@ BENCHMARK_REPEATS = 200
 ####################################################################################################
 ####################################################################################################
 
-# the chunk sizes to use for original and fused kernels
-# note that the original kernel and fused kernel have different optimal chunk sizes
-CHUNK_SIZE_ORIGINAL=128#256
-CHUNK_SIZE_FUSED=128
-
-# more settings for test tensors, probably best to leave as is
-have_init_states    = False
-have_dt_softplus    = True # TODO: test more
 
 # imports
 import random
@@ -48,14 +49,14 @@ from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 # test functions
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, cu_chunk_seqlens, dt_softplus):
     out = torch.empty_like(x)
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, out, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, cu_chunk_seqlens=cu_chunk_seqlens, dt_softplus=dt_softplus, fused=False)#mamba2_fusion_type="unfused")
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, out, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, cu_chunk_seqlens=cu_chunk_seqlens, dt_softplus=dt_softplus, fused=False)
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED: # can't compare some outputs if chunk sizes differ
         outputs = outputs[0], outputs[1], None, None, None, None, outputs[5]
     return outputs
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, cu_chunk_seqlens, dt_softplus):
     out = torch.empty_like(x)
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, out, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, cu_chunk_seqlens=cu_chunk_seqlens, dt_softplus=dt_softplus, fused=True)#, mamba2_fusion_type="medium")
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, out, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, cu_chunk_seqlens=cu_chunk_seqlens, dt_softplus=dt_softplus, fused=True)#
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
         outputs = outputs[0], outputs[1], None, None, None, None, outputs[5]
     return outputs
@@ -95,11 +96,6 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, fused=False):
     C = torch.randn((seqlen, ngroups, dstate), dtype=torch.float16, device=DEVICE) * 5 + 20
     D = torch.randn((nheads,), dtype=torch.float32, device=DEVICE) * 0.5 + 1.2
     x = torch.randn((seqlen, nheads, headdim,), dtype=torch.float16, device=DEVICE) * 2 + 5
-
-    if have_init_states:
-        initial_states = torch.randn((nheads, headdim, dstate), dtype=torch.float32, device=DEVICE) * 0.2
-    else:
-        initial_states = None
 
     # example at https://github.com/state-spaces/mamba/issues/383
 
@@ -142,6 +138,12 @@ def get_rand_input(dims_b_seq_nh_hd_ng_ds, fused=False):
     seq_idx = torch.tensor(seq_idx_cpu, dtype=torch.int32, device='cuda')
     cu_seqlens = torch.tensor(cu_seqlens_cpu, dtype=torch.int32, device='cuda')
     cu_chunk_seqlens = torch.tensor(cu_chunk_seqlens_cpu, dtype=torch.int32, device='cuda')
+
+    
+    if have_init_states:
+        initial_states = torch.randn((len(cu_seqlens_cpu) - 1, nheads, headdim, dstate), dtype=torch.float16, device=DEVICE) * 0.2
+    else:
+        initial_states = None
 
     return dt, dt_bias, A, B, C, D, x, initial_states, seq_idx, cu_seqlens, cu_chunk_seqlens
 
@@ -189,8 +191,10 @@ def run_unit_test(seqlen):
         for i in range(1, len(outputs_full), 1):
             outputs_i = outputs_full[i][field_idx]
             print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
-            atol = 2.5e-3
-            rtol = 1e-2
+            # atol = 2.5e-3
+            # rtol = 1e-2
+            # from vLLM tests
+            atol, rtol = 5e-3, 5e-3
             outputs_i = outputs_i.to(outputs_0.dtype)
             if torch.allclose(outputs_i, outputs_0, atol=atol, rtol=rtol, equal_nan=True):
                 print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")

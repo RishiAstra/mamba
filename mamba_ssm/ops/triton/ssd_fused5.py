@@ -530,11 +530,6 @@ def _fused5_ssd_kernel(
         )
         seq_idx_new = tl.load(seq_idx_ptr + pid_c * stride_seq_idx_chunk)
 
-        if not HAS_INITSTATES:  # don't let previous chunk affect if new sequence
-            scale = tl.where(
-                seq_idx_new == seq_idx_prev, scale, 0.0
-            )  # TODO: can avoid load instead
-
         # sync
         # the atomic represents which pid_c is ready
         # therefore, wait for it to reach our pid_c
@@ -640,7 +635,7 @@ def _fused5_ssd_kernel(
             + offs_k_dstate[:, None] * prev_state_stride_dstate
         )
 
-        if seq_idx_prev == seq_idx_m: # if new sequence, add previous chunk affect
+        if seq_idx_prev == seq_idx_m or HAS_INITSTATES: # if new sequence, add previous chunk affect
             scale_m = tl.exp(dA_cs_m)
             if BLOCK_SIZE_DSTATE <= CS_WHOLEBLOCK_DS:
                 if (not NEED_MASK_HD) and (not NEED_MASK_CS_DS):
@@ -909,6 +904,7 @@ def _fused5_ssd(
     if initial_states is not None:
         num_varlen_seqs = initial_states.shape[0]
         assert initial_states.shape == (num_varlen_seqs, nheads, hdim, dstate)
+        assert initial_states.dtype == states_G.dtype
 
     initial_states_strides = (
         (

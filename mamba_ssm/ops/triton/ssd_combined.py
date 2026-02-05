@@ -328,6 +328,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     elif env_mamba2_fusion_type != "none":
         raise Exception(f"Bad environment MAMBA2_FUSION_TYPE variable: {env_mamba2_fusion_type}")
 
+    override_states_always_fp16 = False
     if mamba2_fusion_type != "unfused": # all 5 kernels fused
         if mamba2_fusion_type == "medium":
             states_in_fp32 = False
@@ -336,11 +337,11 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
             cs_acc_fp32 = False
             cb_comp_fp32 = True
         elif mamba2_fusion_type == "high":
-            states_in_fp32 = True
+            states_in_fp32 = True if not override_states_always_fp16 else False
             cb_store_fp32 = True
             cb_scale_fp32 = True
             cs_acc_fp32 = True
-            cb_comp_fp32 = True
+            cb_comp_fp32 = False # original does cb computation in cb dtype
         else:
             raise Exception(f"unsupported mamba2_fusion_type: {mamba2_fusion_type}")
 
@@ -356,7 +357,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
         # dA_cumsum_tmp2, dt_tmp2 = _chunk_cumsum_fwd(dt[:, 147:256], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
         dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
-        states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+        states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=not override_states_always_fp16)
         # states_tmp0 = _chunk_state_fwd(B[:, :147], x[:, :147], dt_tmp0, dA_cumsum_tmp0, states_in_fp32=True)
         # states_tmp1 = _chunk_state_fwd(B[:, 147:], x[:, 147:], dt_tmp1, dA_cumsum_tmp1, states_in_fp32=True)
         # states_tmp2 = _chunk_state_fwd(B[:, 147:256], x[:, 147:256], dt_tmp2, dA_cumsum_tmp2, states_in_fp32=True)

@@ -607,7 +607,7 @@ def _fused5_ssd(
     if initial_states is not None:
         # batch, nchunks, nheads, hdim, dstate
         # batch, nheads, hdim, dstate
-        states_G[:, 0, :, :, :] = initial_states[:, None, :, :, :]
+        states_G[:, 0, :, :, :] = initial_states.squeeze(1)
     else:
         states_G[:, 0, :, :, :] = 0
 

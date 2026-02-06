@@ -330,7 +330,6 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
 
     if mamba2_fusion_type != "unfused": # all 5 kernels fused
         if mamba2_fusion_type == "medium":
-            states_in_fp32 = False
             cb_store_fp32 = False
             cb_scale_fp32 = False
             cs_acc_fp32 = False

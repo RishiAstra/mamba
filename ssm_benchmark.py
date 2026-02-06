@@ -6,21 +6,23 @@
 
 # check correctness or benchmark
 CHECK_CORRECTNESS = True
-atol = 1e-3
-rtol = 1e-3
+atol = 0#1e-3
+rtol = 0#1e-3
 
 
 # more settings for test tensors, probably best to leave as is
+states_in_fp32 = False
+init_states_fp32 = False
+fused_type = "high"
 have_init_states    = True
 have_dt_softplus    = True # TODO: test more
 have_z = False
-init_states_fp32 = False
 have_seq_idx        = False
 
 # the chunk sizes to use for original and fused kernels
-# note that the original kernel and fused kernel have different optimal chunk sizes
-CHUNK_SIZE_ORIGINAL=128#256
-CHUNK_SIZE_FUSED=128
+# note that fp32 does best with 256, fp16 with 128
+CHUNK_SIZE_ORIGINAL =128
+CHUNK_SIZE_FUSED    =128
 
 # dimensions to test
 batch       = 1
@@ -39,7 +41,7 @@ test_sizes = [
 ]
 
 # Time to run each benchmark (ms)
-BENCHMARK_REPEATS = 200
+BENCHMARK_REPEATS = 1000
 
 ####################################################################################################
 ####################################################################################################
@@ -55,13 +57,13 @@ from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_fwd
 
 # test functions
 def run_original_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, mamba2_fusion_type="unfused")
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, states_in_fp32=states_in_fp32, mamba2_fusion_type="unfused")
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED: # can't compare some outputs if chunk sizes differ
         outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     return outputs
 
 def run_fused_ssd(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus):
-    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, mamba2_fusion_type="medium")
+    outputs = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, states_in_fp32=states_in_fp32, mamba2_fusion_type=fused_type)
     if CHUNK_SIZE_ORIGINAL != CHUNK_SIZE_FUSED:
         outputs = outputs[0], outputs[1], None, None, None, outputs[5]
     return outputs

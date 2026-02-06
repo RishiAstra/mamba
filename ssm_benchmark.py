@@ -6,6 +6,8 @@
 
 # check correctness or benchmark
 CHECK_CORRECTNESS = True
+atol = 1e-3
+rtol = 1e-3
 
 
 # more settings for test tensors, probably best to leave as is
@@ -69,7 +71,7 @@ things_to_compare = [
     (run_fused_ssd, "Fused", "red"),
 ]
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+DEVICE = 'cuda'
 
 configs = []
 configs.append(
@@ -167,8 +169,6 @@ def run_unit_test(seqlen):
             outputs_0 = outputs_full[0][field_idx]
             outputs_i = outputs_full[i][field_idx]
             print(f"ref shape: {outputs_0.shape}, test shape: {outputs_i.shape}")
-            atol = 1e-3#0#2.5e-3
-            rtol = 1e-3#0#1e-2
             outputs_i = outputs_i.to(outputs_0.dtype)
             if torch.allclose(outputs_i, outputs_0, atol=atol, rtol=rtol, equal_nan=True):
                 print(f"✅ {things_to_compare[i][1]} and {things_to_compare[0][1]} match")

@@ -104,7 +104,7 @@ def _fused5_ssd_kernel(
     HAS_SEQ_IDX: tl.constexpr, IS_TRITON_22: tl.constexpr, DT_SOFTPLUS: tl.constexpr, HAS_DT_BIAS: tl.constexpr,
     CB_SCALE_FP32: tl.constexpr,
     CS_ACC_FP32: tl.constexpr,
-    CB_COMP_FP32: tl.constexpr,
+    CB_COMP_DTYPE: tl.constexpr,
     # Block sizes
     BLOCK_SIZE_HD: tl.constexpr, BLOCK_SIZE_DS: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr, 
     CS_BLOCK_SIZE_DS: tl.constexpr, CS_BLOCK_SIZE_CS_outer: tl.constexpr, CS_BLOCK_SIZE_CS_inner: tl.constexpr, CS_WHOLEBLOCK_DS: tl.constexpr,
@@ -236,13 +236,10 @@ def _fused5_ssd_kernel(
             b_ptrs = b_ptr_bmm + (offs_k[:, None] * stride_b_dstate + offs_n[None, :] * stride_b_seqlen)
             chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
-            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=tl.float32 if CB_COMP_FP32 else cb_ptr.dtype.element_ty)
+            acc = tl.zeros((BMM_BLOCK_SIZE_M, BMM_BLOCK_SIZE_N), dtype=CB_COMP_DTYPE)
             for k in range(0, tl.cdiv(dstate, BMM_BLOCK_SIZE_K)):
-                a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0)
-                b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0)
-                if CB_COMP_FP32:
-                    a = a.to(acc.dtype)
-                    b = b.to(acc.dtype)
+                a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k * BMM_BLOCK_SIZE_K), other=0.0).to(acc.dtype)
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < dstate - k * BMM_BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0).to(acc.dtype)
                 acc += tl.dot(a, b, out_dtype=acc.dtype)
                 a_ptrs += BMM_BLOCK_SIZE_K * stride_C_dstate
                 b_ptrs += BMM_BLOCK_SIZE_K * stride_b_dstate
@@ -565,7 +562,12 @@ def _fused5_ssd(
         assert seq_idx.shape == (batch, seqlen)
     states_dtype = torch.float32 if states_in_fp32 else B.dtype
     # setup from bmm
-    CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32 if cb_store_fp32 else torch.float16)
+    # CB_dtype = C.dtype if output_dtype is None else output_dtype
+    CB_comp_dtype = (tl.bfloat16 if C.dtype == torch.bfloat16 or B.dtype == torch.bfloat16 else
+                 (tl.float16 if A.dtype == torch.float16 or B.dtype == torch.float16 else tl.float32))
+    if cb_comp_fp32:
+        CB_comp_dtype = tl.float32
+    CB = torch.empty((batch, nchunks, ngroups, chunk_size, chunk_size), device=C.device, dtype=torch.float32 if cb_store_fp32 else C.dtype)
     # setup from state passing
     dA_chunk_cumsum = dA_cumsum[:, :, :, -1]
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
@@ -662,7 +664,7 @@ def _fused5_ssd(
         HAS_DT_BIAS=dt_bias is not None,
         CB_SCALE_FP32=cb_scale_fp32,
         CS_ACC_FP32=cs_acc_fp32,
-        CB_COMP_FP32=cb_comp_fp32,
+        CB_COMP_DTYPE=CB_comp_dtype,
     )
 
     # states_G holds both states and final states

@@ -154,7 +154,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
 
-    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None, mamba2_fusion_type="unfused"):
+    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None, mamba2_states_dtype="fp32", mamba2_fusion_type="unfused"):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
@@ -203,6 +203,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 ngroups=self.ngroups,
                 norm_before_gate=self.norm_before_gate,
                 **dt_limit_kwargs,
+                mamba2_states_dtype=mamba2_states_dtype,
                 mamba2_fusion_type=mamba2_fusion_type,
             )
             if seqlen_og is not None:
@@ -261,6 +262,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 **dt_limit_kwargs,
                 return_final_states=ssm_state is not None,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
+                mamba2_states_dtype=mamba2_states_dtype,
                 mamba2_fusion_type=mamba2_fusion_type,
             )
             if ssm_state is not None:

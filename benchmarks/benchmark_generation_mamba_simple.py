@@ -32,6 +32,8 @@ parser.add_argument("--fused-mamba2-precision", type=str, default="unfused",
                     " \"medium\": fp16.  with some fp32 values."
                     " \"unfused\": uses the original unfused kernels."
                     " For performance, \"medium\" is recommended in most cases.")
+parser.add_argument("--mamba2-states-dtype", type=str, default="fp32", choices=["auto", "fp32"],
+                    help="Data type for Mamba states, can be fp32 or auto based on input dtype.")
 args = parser.parse_args()
 
 repeats = 3
@@ -59,7 +61,10 @@ else:
     attn_mask = tokens.attention_mask.to(device=device)
 max_length = input_ids.shape[1] + args.genlen
 
-model_kwargs = {"mamba2_fusion_type": args.fused_mamba2_precision}
+model_kwargs = {
+    "mamba2_fusion_type": args.fused_mamba2_precision,
+    "mamba2_states_dtype": args.mamba2_states_dtype,
+}
 
 if is_mamba:
     fn = lambda: model.generate(

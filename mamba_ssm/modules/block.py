@@ -67,9 +67,15 @@ class Block(nn.Module):
             )
 
         # Handle special fused kernel for Mamba2
-        if "mamba2_fusion_type" in mixer_kwargs and not isinstance(self.mixer, Mamba2):
-            # don't modify original reference
-            mixer_kwargs = mixer_kwargs.copy().pop("mamba2_fusion_type")
+        has_fusion_flag = "mamba2_fusion_type" in mixer_kwargs
+        has_states_dtype_flag = "mamba2_states_dtype" in mixer_kwargs
+        if (has_fusion_flag or has_states_dtype_flag) and not isinstance(self.mixer, Mamba2):
+            # need to ignore these flags if not a Mamba2 layer
+            mixer_kwargs = mixer_kwargs.copy()
+            if has_fusion_flag:
+                mixer_kwargs.pop("mamba2_fusion_type")
+            if has_states_dtype_flag:
+                mixer_kwargs.pop("mamba2_states_dtype")
         hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
 
         if self.mlp is not None:
